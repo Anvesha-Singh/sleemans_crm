@@ -610,7 +610,8 @@ def edit_customer():
     if request.method == "POST":
         phone = normalize_phone(request.form.get("phone"))
         conn = get_db()
-        conn.execute('''
+        cur = conn.cursor()
+        cur.execute('''
             UPDATE customers
             SET name=%s, address=%s, town=%s, postcode=%s, gas_request=%s
             WHERE phone=%s
@@ -623,6 +624,7 @@ def edit_customer():
             phone
         ))
         conn.commit()
+        cur.close()
         conn.close()
         return redirect(f"/lookup?phone={phone}")
 
