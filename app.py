@@ -18,9 +18,15 @@ app = Flask(__name__)
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 DB_URL = os.getenv("DATABASE_URL")  
+if DB_URL and DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
 def get_db():
-    conn = psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.DictCursor)
+    conn = psycopg2.connect(
+        DB_URL, 
+        cursor_factory=psycopg2.extras.DictCursor,
+        sslmode='require' 
+    )
     return conn
 
 def normalize_phone(phone):
