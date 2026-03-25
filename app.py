@@ -648,6 +648,4 @@ def api_orders():
 
 
 if __name__ == "__main__":
-    # Local dev: python app.py
-    # Production (Render / Railway): gunicorn app:app --bind 0.0.0.0:$PORT
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
