@@ -22,11 +22,14 @@ if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
 def get_db():
-    conn = psycopg2.connect(
-        DB_URL, 
-        cursor_factory=psycopg2.extras.DictCursor,
-        sslmode='require' 
-    )
+    url = os.getenv("DB_URL")
+    if not url:
+        # This will show up clearly in your Railway logs
+        print("ERROR: DB_URL environment variable is missing!")
+        raise ValueError("DB_URL is not set in the environment")
+    
+    # Supabase REQUIRES sslmode='require' for external connections
+    conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.DictCursor, sslmode='require')
     return conn
 
 def normalize_phone(phone):
