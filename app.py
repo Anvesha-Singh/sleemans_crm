@@ -1,6 +1,7 @@
 from functools import wraps
 from dotenv import load_dotenv
 import os
+from functools import lru_cache
 
 load_dotenv()
 
@@ -136,21 +137,6 @@ def get_all_products():
 
 # ── ANALYTICS HELPERS ─────────────────────────
 
-def get_sales_by_product(start, end):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.name, SUM(oi.quantity) as total
-        FROM order_items oi
-        JOIN orders o ON oi.order_id=o.id
-        JOIN products p ON oi.product_id=p.id
-        WHERE o.order_date BETWEEN %s AND %s
-        GROUP BY p.name
-    """,(start,end))
-    rows = cur.fetchall()
-    cur.close(); conn.close()
-    return rows
-
 def get_top_customers(start, end):
     conn = get_db()
     cur = conn.cursor()
@@ -166,46 +152,6 @@ def get_top_customers(start, end):
     rows = cur.fetchall()
     cur.close(); conn.close()
     return rows
-
-# frequency detection (efficient: compute once per dashboard load)
-def get_customer_frequencies():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT phone, order_date
-        FROM orders
-        ORDER BY phone, order_date
-    """)
-    rows = cur.fetchall()
-    cur.close(); conn.close()
-
-    from collections import defaultdict
-    data = defaultdict(list)
-
-    for r in rows:
-        data[r["phone"]].append(r["order_date"])
-
-    result = []
-    today = datetime.today().date()
-
-    for phone, dates in data.items():
-        if len(dates) < 2:
-            continue
-
-        diffs = [(dates[i]-dates[i-1]).days for i in range(1,len(dates))]
-        avg = sum(diffs)/len(diffs)
-
-        last = dates[-1]
-        expected = last + timedelta(days=round(avg))
-
-        if expected == today:
-            cust = get_customer(phone)
-            result.append({
-                "name": cust["name"] if cust else phone,
-                "freq": round(avg)
-            })
-
-    return result
 
 def get_today_revenue():
     today = datetime.today().date()
@@ -247,25 +193,6 @@ def get_weather(start, end):
         cur += timedelta(days=1)
 
     return data
-
-def get_weather_forecast(days=3):
-    lat, lon = 51.5072, -0.1276
-
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": "temperature_2m_mean",
-        "forecast_days": days,
-        "timezone": "Europe/London"
-    }
-
-    r = requests.get(url, params=params).json()
-
-    dates = r.get("daily", {}).get("time", [])
-    temps = r.get("daily", {}).get("temperature_2m_mean", [])
-
-    return dict(zip(dates, temps))
 
 def get_daily_sales(start, end):
     conn = get_db()
