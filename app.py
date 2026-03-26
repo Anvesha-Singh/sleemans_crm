@@ -40,13 +40,13 @@ def normalize_phone(phone):
         return None
     digits = re.sub(r'\D', '', str(phone))
     if digits.startswith('0'):
-        digits = '+44' + digits[1:]
+        digits = '44' + digits[1:]
     elif len(digits) == 10:
-        digits = '+44' + digits
-    elif digits.startswith('+44'):
+        digits = '44' + digits
+    elif digits.startswith('44'):
         pass
     # truncate to max 12 digits after country code
-    return f"+{digits[:12]}" if digits.startswith('+44') else f"+{digits}"
+    return f"+{digits[:12]}" if digits.startswith('44') else f"+{digits}"
 
 def get_customer(phone):
     """Fetch customer by phone, checking both +44 and 0 formats."""
