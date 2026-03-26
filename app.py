@@ -1083,31 +1083,32 @@ def cash():
             <button class="btn btn-primary" style="margin-left:auto">Add Payment</button>
         </form>
 
-        <table class="modern-table" style="margin-top:16px">
-            <thead>
-                <tr>
-                    <th>Date</th>
-                    <th>Amount (£)</th>
-                    <th>Note</th>
-                    <th style="text-align:right">Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for c in last10 %}
-                <tr>
-                    <td>{{c.date}}</td>
-                    <td>{{c.amount}}</td>
-                    <td>{{c.note}}</td>
-                    <td style="text-align:right">
-                        <form method="POST" action="/delete_cash" style="display:inline">
-                            <input type="hidden" name="id" value="{{c.id}}">
-                            <button class="btn btn-danger">Delete</button>
-                        </form>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
+        rows = ""
+        for c in last10:
+            rows += f"""
+            <tr>
+                <td>{c['date']}</td>
+                <td>{c['amount']}</td>
+                <td>{c['note']}</td>
+                <td style="text-align:right">
+                    <form method="POST" action="/delete_cash" style="display:inline">
+                        <input type="hidden" name="id" value="{c['id']}">
+                        <button class="btn btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            """
+
+        body = f"""
+        <table class="modern-table">
+        <thead>
+        <tr><th>Date</th><th>Amount (£)</th><th>Note</th><th>Actions</th></tr>
+        </thead>
+        <tbody>
+        {rows}
+        </tbody>
         </table>
+        """
     </div>
 
     <div class="section-header"><h3>Recent</h3></div>
