@@ -1190,6 +1190,7 @@ def inventory():
         "<h1>Inventory</h1>"
         "<div style='display:flex;justify-content:flex-end;margin-bottom:8px'>"
         "<button class='btn btn-primary' onclick='enableEdit();return false;'>Edit Inventory</button>"
+        "<a href='/inventory' class='btn btn-secondary'>Cancel</a>"
         "</div>"
         "<form method='POST' style='width:100%'>"
         "<table class='modern-table' style='width:100%;border-collapse:collapse'>"
