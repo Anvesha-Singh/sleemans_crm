@@ -116,6 +116,26 @@ def get_all_customers():
     conn.close()
     return [dict(r) for r in rows]
 
+def get_products_sold(start, end):
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT p.name, SUM(oi.quantity) as qty
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.id
+        JOIN products p ON oi.product_id = p.id
+        WHERE o.order_date BETWEEN %s AND %s
+        GROUP BY p.name
+        ORDER BY qty DESC
+    """, (start, end))
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return [{"name": r["name"], "qty": r["qty"]} for r in rows]
+
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
