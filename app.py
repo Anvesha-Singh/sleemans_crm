@@ -1,4 +1,6 @@
+import csv
 from functools import wraps
+import io
 from dotenv import load_dotenv
 import os
 from functools import lru_cache
@@ -875,7 +877,6 @@ def edit_customer():
 
         conn = get_db()
         cur = conn.cursor()
-
         cur.execute('''
             UPDATE customers
             SET name=%s, address=%s, town=%s, postcode=%s, gas_request=%s
@@ -888,11 +889,9 @@ def edit_customer():
             request.form.get("gas_request"),
             phone
         ))
-
         conn.commit()
         cur.close()
         conn.close()
-
         return redirect(f"/lookup?phone={phone}")
 
     user = get_customer(phone)
@@ -901,15 +900,35 @@ def edit_customer():
     <h1>Edit Customer</h1>
     <div class="card">
       <form method="POST">
-        <input type="hidden" name="phone" value="{phone}">
-        <input name="name" value="{user.get("name","")}">
-        <input name="address" value="{user.get("address","")}">
-        <input name="town" value="{user.get("town","")}">
-        <input name="postcode" value="{user.get("postcode","")}">
-        <input name="gas_request" value="{user.get("gas_request","")}">
+        <div class="form-group">
+            <label>Phone</label>
+            <input type="tel" name="phone" value="{phone}" class="modern-input" disabled>
+        </div>
+        <div class="form-group">
+            <label>Name</label>
+            <input type="text" name="name" value="{user.get('name','')}" class="modern-input">
+        </div>
+        <div class="form-group">
+            <label>Address</label>
+            <input type="text" name="address" value="{user.get('address','')}" class="modern-input">
+        </div>
+        <div class="form-group">
+            <label>Town</label>
+            <input type="text" name="town" value="{user.get('town','')}" class="modern-input">
+        </div>
+        <div class="form-group">
+            <label>Postcode</label>
+            <input type="text" name="postcode" value="{user.get('postcode','')}" class="modern-input">
+        </div>
+        <div class="form-group">
+            <label>Gas Request</label>
+            <input type="text" name="gas_request" value="{user.get('gas_request','')}" class="modern-input">
+        </div>
 
-        <button name="save">Save</button>
-        <button name="cancel">Cancel</button>
+        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
+            <button class="btn btn-primary" name="save">Save</button>
+            <button class="btn btn-secondary" name="cancel">Cancel</button>
+        </div>
       </form>
     </div>
     '''
@@ -921,119 +940,164 @@ def analytics():
     start = request.args.get("start") or (datetime.today()-timedelta(days=7)).strftime("%Y-%m-%d")
     end = request.args.get("end") or datetime.today().strftime("%Y-%m-%d")
 
-    daily = get_daily_sales(start,end)
-    weather = get_weather_range(start,end)
-    top = get_top_customers(start,end)
+    # Data fetching
+    products_sold = get_products_sold(start, end)  # [{'name':..., 'qty':...}, ...]
+    daily = get_daily_sales(start, end)
+    top_customers = get_top_customers(start, end)
     preds = predict_next_calls(3)
     inventory = get_inventory_status()
+
+    # Revenue today
     orders_rev, cash_rev = get_today_revenue()
+
+    # Prepare data for charts
+    prod_labels = [p['name'] for p in products_sold]
+    prod_qty = [p['qty'] for p in products_sold]
+
+    top_labels = [c['name'] for c in top_customers]
+    top_orders = [c['cnt'] for c in top_customers]
 
     dates = [str(r["order_date"]) for r in daily]
     sales = [r["total"] for r in daily]
-    temps = [round(weather.get(d, 0), 1) for d in dates]
 
     body = f"""
-      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-      <h1>Analytics</h1>
+    <h1>Analytics</h1>
 
-      <form style="display:flex;gap:8px;align-items:center;margin-bottom:16px">
-          <input type="date" name="start" value="{start}" class="modern-input">
-          <input type="date" name="end" value="{end}" class="modern-input">
-          <button class="btn btn-primary">Apply</button>
-      </form>
+    <form style="display:flex;gap:8px;align-items:center;margin-bottom:16px">
+        <input type="date" name="start" value="{start}">
+        <input type="date" name="end" value="{end}">
+        <button class="btn btn-primary">Apply</button>
+        <a href="/download_customers" class="btn btn-secondary">Download Customers CSV</a>
+        <a href="/download_orders?start={start}&end={end}" class="btn btn-secondary">Download Orders CSV</a>
+    </form>
 
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:24px">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
 
-          <div class="card" style="padding:16px">
-              <h3>Sales vs Weather</h3>
-              <canvas id="combo" style="height:300px"></canvas>
-          </div>
+        <!-- Product Count Graph -->
+        <div class="card">
+            <h3>Products Sold (Qty)</h3>
+            <canvas id="product-count"></canvas>
+        </div>
 
-          <div class="card" style="padding:16px">
-              <h3>Top Customers</h3>
-              <canvas id="customers" style="height:300px"></canvas>
-          </div>
+        <!-- Top Customers Graph -->
+        <div class="card">
+            <h3>Top Customers</h3>
+            <canvas id="top-customers"></canvas>
+        </div>
 
-          <div class="card" style="padding:16px">
-              <h3>Revenue Today</h3>
-              <canvas id="revenue" style="height:300px"></canvas>
-          </div>
+        <!-- Revenue Today -->
+        <div class="card">
+            <h3>Revenue Today (£)</h3>
+            <canvas id="revenue"></canvas>
+        </div>
 
-          <div class="card" style="padding:16px">
-              <h3>Expected Calls</h3>
-              <div>Today: {', '.join(preds[0]) or 'None'}</div>
-              <div>Tomorrow: {', '.join(preds[1]) or 'None'}</div>
-              <div>Day After: {', '.join(preds[2]) or 'None'}</div>
-          </div>
+        <!-- Expected Calls -->
+        <div class="card">
+            <h3>Expected Calls</h3>
+            <div>Today: {', '.join(preds[0]) or 'None'}</div>
+            <div>Tomorrow: {', '.join(preds[1]) or 'None'}</div>
+            <div>Day After: {', '.join(preds[2]) or 'None'}</div>
+        </div>
 
-          <div class="card" style="padding:16px">
-              <h3>Inventory Depletion</h3>
-              {"".join([f"<div>{i['name']} → {i['stock']} left (~{i['days_left']} days)</div>" for i in inventory])}
-          </div>
+        <!-- Inventory Depletion -->
+        <div class="card" style="grid-column:1 / span 2">
+            <h3>Inventory Depletion</h3>
+            {"".join([f"<div>{i['name']} → {i['stock']} left (~{i['days_left']} days)</div>" for i in inventory])}
+        </div>
 
-      </div>
+    </div>
 
-      <script>
-      new Chart(document.getElementById('combo'), {{
-          data: {{
-              labels: {json.dumps(dates)},
-              datasets: [
-                  {{
-                      type: 'bar',
-                      label: 'Gas Sold',
-                      data: {json.dumps(sales)},
-                      yAxisID: 'y',
-                      backgroundColor: '#4f46e5'
-                  }},
-                  {{
-                      type: 'line',
-                      label: 'Temp (°C)',
-                      data: {json.dumps(temps)},
-                      yAxisID: 'y1',
-                      borderColor: '#f59e0b',
-                      tension: 0.3,
-                      fill: false
-                  }}
-              ]
-          }},
-          options: {{
-              responsive:true,
-              scales: {{
-                  y: {{ beginAtZero: true, title: {{display:true,text:'Units'}} }},
-                  y1: {{ position: 'right', title: {{display:true,text:'Temp (°C)'}} }}
-              }}
-          }}
-      }});
+    <script>
+    // Products sold bar chart
+    new Chart(document.getElementById('product-count'), {{
+        type: 'bar',
+        data: {{
+            labels: {json.dumps(prod_labels)},
+            datasets: [{{
+                label: 'Quantity Sold',
+                data: {json.dumps(prod_qty)},
+                backgroundColor: 'rgba(54,162,235,0.6)',
+                borderColor: 'rgba(54,162,235,1)',
+                borderWidth: 1
+            }}]
+        }},
+        options: {{ responsive:true, plugins: {{ legend: {{ display:false }} }} }}
+    }});
 
-      new Chart(document.getElementById('customers'), {{
-          type: 'bar',
-          data: {{
-              labels: {json.dumps([r["name"] for r in top])},
-              datasets: [{{
-                  label: 'Orders',
-                  data: {json.dumps([r["cnt"] for r in top])},
-                  backgroundColor: '#4ade80'
-              }}]
-          }},
-          options: {{ responsive:true, plugins: {{ legend: {{ display:false }} }} }}
-      }});
+    // Top customers bar chart
+    new Chart(document.getElementById('top-customers'), {{
+        type: 'bar',
+        data: {{
+            labels: {json.dumps(top_labels)},
+            datasets: [{{
+                label: 'Orders',
+                data: {json.dumps(top_orders)},
+                backgroundColor: 'rgba(255,99,132,0.6)',
+                borderColor: 'rgba(255,99,132,1)',
+                borderWidth: 1
+            }}]
+        }},
+        options: {{ responsive:true }}
+    }});
 
-      new Chart(document.getElementById('revenue'), {{
-          type: 'pie',
-          data: {{
-              labels: ['Orders','Cash'],
-              datasets: [{{
-                  data: [{orders_rev},{cash_rev}],
-                  backgroundColor: ['#4f46e5','#f87171']
-              }}]
-          }},
-          options: {{ responsive:true }}
-      }});
-      </script>
-      """
+    // Revenue pie chart
+    new Chart(document.getElementById('revenue'), {{
+        type: 'pie',
+        data: {{
+            labels: ['Orders','Cash'],
+            datasets: [{{
+                data: [{orders_rev},{cash_rev}],
+                backgroundColor: ['rgba(75,192,192,0.6)','rgba(255,205,86,0.6)'],
+                borderColor: ['rgba(75,192,192,1)','rgba(255,205,86,1)']
+            }}]
+        }},
+        options: {{ responsive:true }}
+    }});
+    </script>
+    """
 
     return page("Analytics", body, wide=True)
+
+@app.route("/download_customers")
+@login_required
+def download_customers():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM customers")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    si = io.StringIO()
+    writer = csv.DictWriter(si, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    return requests.Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment;filename=customers.csv"})
+
+@app.route("/download_orders")
+@login_required
+def download_orders():
+    start = request.args.get("start")
+    end = request.args.get("end")
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT o.id,o.phone,o.order_date,p.name,oi.quantity,p.price
+        FROM orders o
+        JOIN order_items oi ON o.id = oi.order_id
+        JOIN products p ON oi.product_id = p.id
+        WHERE o.order_date BETWEEN %s AND %s
+        ORDER BY o.order_date DESC
+    """,(start,end))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    si = io.StringIO()
+    writer = csv.DictWriter(si, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    return requests.Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition":f"attachment;filename=orders_{start}_{end}.csv"})
 
 @app.route("/cash", methods=["GET","POST"])
 @login_required
