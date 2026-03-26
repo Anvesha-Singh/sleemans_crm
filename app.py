@@ -933,92 +933,105 @@ def analytics():
     temps = [round(weather.get(d, 0), 1) for d in dates]
 
     body = f"""
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-    <h1>Analytics</h1>
+      <h1>Analytics</h1>
 
-    <form>
-        <input type="date" name="start" value="{start}">
-        <input type="date" name="end" value="{end}">
-        <button>Apply</button>
-    </form>
+      <form style="display:flex;gap:8px;align-items:center;margin-bottom:16px">
+          <input type="date" name="start" value="{start}" class="modern-input">
+          <input type="date" name="end" value="{end}" class="modern-input">
+          <button class="btn btn-primary">Apply</button>
+      </form>
 
-    <div class="card">
-        <h3>Sales vs Weather</h3>
-        <canvas id="combo"></canvas>
-    </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:24px">
 
-    <div class="card">
-        <h3>Top Customers</h3>
-        <canvas id="customers"></canvas>
-    </div>
+          <div class="card" style="padding:16px">
+              <h3>Sales vs Weather</h3>
+              <canvas id="combo" style="height:300px"></canvas>
+          </div>
 
-    <div class="card">
-        <h3>Expected Calls</h3>
-        <div>Today: {', '.join(preds[0]) or 'None'}</div>
-        <div>Tomorrow: {', '.join(preds[1]) or 'None'}</div>
-        <div>Day After: {', '.join(preds[2]) or 'None'}</div>
-    </div>
+          <div class="card" style="padding:16px">
+              <h3>Top Customers</h3>
+              <canvas id="customers" style="height:300px"></canvas>
+          </div>
 
-    <div class="card">
-        <h3>Inventory Depletion</h3>
-        {"".join([f"<div>{i['name']} → {i['stock']} left (~{i['days_left']} days)</div>" for i in inventory])}
-    </div>
+          <div class="card" style="padding:16px">
+              <h3>Revenue Today</h3>
+              <canvas id="revenue" style="height:300px"></canvas>
+          </div>
 
-    <div class="card">
-        <h3>Revenue Today</h3>
-        <canvas id="revenue"></canvas>
-    </div>
+          <div class="card" style="padding:16px">
+              <h3>Expected Calls</h3>
+              <div>Today: {', '.join(preds[0]) or 'None'}</div>
+              <div>Tomorrow: {', '.join(preds[1]) or 'None'}</div>
+              <div>Day After: {', '.join(preds[2]) or 'None'}</div>
+          </div>
 
-    <script>
-    new Chart(document.getElementById('combo'), {{
-        data: {{
-            labels: {json.dumps(dates)},
-            datasets: [
-                {{
-                    type: 'bar',
-                    label: 'Gas Sold',
-                    data: {json.dumps(sales)},
-                    yAxisID: 'y'
-                }},
-                {{
-                    type: 'line',
-                    label: 'Temp (°C)',
-                    data: {json.dumps(temps)},
-                    yAxisID: 'y1'
-                }}
-            ]
-        }},
-        options: {{
-            scales: {{
-                y: {{ beginAtZero: true }},
-                y1: {{ position: 'right' }}
-            }}
-        }}
-    }});
+          <div class="card" style="padding:16px">
+              <h3>Inventory Depletion</h3>
+              {"".join([f"<div>{i['name']} → {i['stock']} left (~{i['days_left']} days)</div>" for i in inventory])}
+          </div>
 
-    new Chart(document.getElementById('customers'), {{
-        type: 'bar',
-        data: {{
-            labels: {json.dumps([r["name"] for r in top])},
-            datasets: [{{
-                label: 'Orders',
-                data: {json.dumps([r["cnt"] for r in top])}
-            }}]
-        }}
-    }});
+      </div>
 
-    new Chart(document.getElementById('revenue'), {{
-        type: 'pie',
-        data: {{
-            labels: ['Orders','Cash'],
-            datasets: [{{
-                data: [{orders_rev},{cash_rev}]
-            }}]
-        }}
-    }});
-    </script>
-    """
+      <script>
+      new Chart(document.getElementById('combo'), {{
+          data: {{
+              labels: {json.dumps(dates)},
+              datasets: [
+                  {{
+                      type: 'bar',
+                      label: 'Gas Sold',
+                      data: {json.dumps(sales)},
+                      yAxisID: 'y',
+                      backgroundColor: '#4f46e5'
+                  }},
+                  {{
+                      type: 'line',
+                      label: 'Temp (°C)',
+                      data: {json.dumps(temps)},
+                      yAxisID: 'y1',
+                      borderColor: '#f59e0b',
+                      tension: 0.3,
+                      fill: false
+                  }}
+              ]
+          }},
+          options: {{
+              responsive:true,
+              scales: {{
+                  y: {{ beginAtZero: true, title: {{display:true,text:'Units'}} }},
+                  y1: {{ position: 'right', title: {{display:true,text:'Temp (°C)'}} }}
+              }}
+          }}
+      }});
+
+      new Chart(document.getElementById('customers'), {{
+          type: 'bar',
+          data: {{
+              labels: {json.dumps([r["name"] for r in top])},
+              datasets: [{{
+                  label: 'Orders',
+                  data: {json.dumps([r["cnt"] for r in top])},
+                  backgroundColor: '#4ade80'
+              }}]
+          }},
+          options: {{ responsive:true, plugins: {{ legend: {{ display:false }} }} }}
+      }});
+
+      new Chart(document.getElementById('revenue'), {{
+          type: 'pie',
+          data: {{
+              labels: ['Orders','Cash'],
+              datasets: [{{
+                  data: [{orders_rev},{cash_rev}],
+                  backgroundColor: ['#4f46e5','#f87171']
+              }}]
+          }},
+          options: {{ responsive:true }}
+      }});
+      </script>
+      """
 
     return page("Analytics", body, wide=True)
 
@@ -1178,21 +1191,21 @@ def inventory():
     cur.close()
     conn.close()
 
-    # Build table rows
+    # 1. Table rows with uniform styling
     table_rows = ""
     for r in rows:
         table_rows += (
             "<tr>"
-            f"<td><input type='text' name='name_{r['id']}' value='{r['name']}' class='modern-input' disabled></td>"
-            f"<td><input type='number' name='price_{r['id']}' value='{r['price']}' step='0.01' class='modern-input' disabled></td>"
-            f"<td><input type='number' name='qty_{r['id']}' value='{r['qty']}' class='modern-input' disabled></td>"
+            f"<td><input type='text' name='name_{r['id']}' value='{r['name']}' class='modern-input' style='background:#f0f0f0' disabled></td>"
+            f"<td><input type='number' name='price_{r['id']}' value='{r['price']}' step='0.01' class='modern-input' style='background:#f0f0f0' disabled></td>"
+            f"<td><input type='number' name='qty_{r['id']}' value='{r['qty']}' class='modern-input' style='background:#f0f0f0' disabled></td>"
             "<td style='text-align:right'>"
-            f"<button type='submit' name='edit_pid' value='{r['id']}' class='btn btn-ghost' disabled>Save</button> "
             f"<button type='submit' name='delete_pid' value='{r['id']}' class='btn btn-danger'>Delete</button>"
             "</td>"
             "</tr>"
         )
 
+    # 2. Buttons at top and bottom, singular Save at bottom
     body = (
         "<h1>Inventory</h1>"
         "<div style='display:flex;justify-content:flex-end;margin-bottom:8px'>"
@@ -1212,13 +1225,16 @@ def inventory():
         "<input type='number' name='new_qty' placeholder='Qty' class='modern-input'>"
         "<button type='submit' class='btn btn-primary'>Add Product</button>"
         "</div>"
+
+        "<div style='margin-top:24px;text-align:right'>"
+        "<button type='submit' class='btn btn-primary'>Save All</button>"
+        "</div>"
         "</form>"
 
         "<script>"
         "function enableEdit(){"
-        "  document.querySelectorAll('input.modern-input').forEach(i=>i.disabled=false);"
-        "  document.querySelectorAll('button[name=edit_pid]').forEach(b=>b.disabled=false);"
-        "}"
+        "  document.querySelectorAll('input.modern-input').forEach(i=>{i.disabled=false;i.style.background='white'});"
+        "} "
         "</script>"
     )
 
