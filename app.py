@@ -1092,7 +1092,7 @@ def download_customers():
     si = io.StringIO()
     writer = csv.DictWriter(si, fieldnames=rows[0].keys())
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows([dict(r) for r in rows])
     return requests.Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition":"attachment;filename=customers.csv"})
 
 @app.route("/download_orders")
@@ -1116,7 +1116,7 @@ def download_orders():
     si = io.StringIO()
     writer = csv.DictWriter(si, fieldnames=rows[0].keys())
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows([dict(r) for r in rows])
     return requests.Response(si.getvalue(), mimetype="text/csv", headers={"Content-Disposition":f"attachment;filename=orders_{start}_{end}.csv"})
 
 @app.route("/cash", methods=["GET","POST"])
