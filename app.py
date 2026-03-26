@@ -677,7 +677,7 @@ def delete_order():
 @app.route("/save_order", methods=["POST"])
 @login_required
 def save_order():
-    phone = normalize_phone(request.form.get("phone"))
+    phone = clean_phone(request.form.get("phone"))
     date = request.form.get("date") or str(datetime.today().date())
 
     try:
@@ -796,10 +796,10 @@ def search():
 @app.route("/add_customer", methods=["GET","POST"])
 @login_required
 def add_customer():
-    phone_prefill = normalize_phone(request.args.get("phone",""))
+    phone_prefill = clean_phone(request.args.get("phone",""))
 
     if request.method == "POST":
-        phone = normalize_phone(request.form.get("phone"))
+        phone = clean_phone(request.form.get("phone"))
         name  = request.form.get("name")
         address = request.form.get("address")
         town = request.form.get("town")
@@ -860,7 +860,7 @@ def add_customer():
 @app.route("/edit_customer", methods=["GET", "POST"])
 @login_required
 def edit_customer():
-    phone = normalize_phone(request.args.get("phone"))
+    phone = clean_phone(request.args.get("phone"))
 
     if request.method == "POST":
         if "cancel" in request.form:
@@ -1275,7 +1275,7 @@ def cash():
 @app.route("/api/orders")
 @login_required
 def api_orders():
-    phone = normalize_phone(request.args.get("phone", ""))
+    phone = clean_phone(request.args.get("phone", ""))
     return jsonify(get_orders(phone) if phone else [])
 
 if __name__ == "__main__":
