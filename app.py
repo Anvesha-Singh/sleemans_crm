@@ -11,7 +11,7 @@ import psycopg2
 import psycopg2.extras
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, redirect, jsonify
 
 app = Flask(__name__)
@@ -36,42 +36,67 @@ def normalize_phone(phone):
     if not phone:
         return None
     clean = re.sub(r'\D', '', str(phone))
-    if clean.startswith('0'):
-        clean = '44' + clean[1:]
-    elif len(clean) == 10:
-        clean = '44' + clean
-    return f"+{clean}" if clean else None
 
+    if clean.startswith('44'):
+        return "+44" + clean[2:]
+    if clean.startswith('0'):
+        return "+44" + clean[1:]
+    if len(clean) == 10:
+        return "+44" + clean
+
+    return "+44" + clean
+
+# NEW: flexible lookup
 def get_customer(phone):
+    if not phone:
+        return None
+
+    variants = [
+        phone,
+        phone.replace("+44", "0"),
+        phone.replace("+44", "")
+    ]
+
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM customers WHERE phone = %s", (phone,))
+    cur.execute(
+        "SELECT * FROM customers WHERE phone = ANY(%s)",
+        (variants,)
+    )
     row = cur.fetchone()
     cur.close()
     conn.close()
     return dict(row) if row else None
 
-def get_orders(phone):
+def get_orders(phone, limit=None):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute('''
-        SELECT o.id, o.order_date, o.notes, p.name AS product, oi.quantity
+
+    q = '''
+        SELECT o.id, o.order_date, p.name, oi.quantity, p.price
         FROM orders o
         JOIN order_items oi ON o.id = oi.order_id
-        JOIN products   p  ON oi.product_id = p.id
+        JOIN products p ON oi.product_id = p.id
         WHERE o.phone = %s
         ORDER BY o.order_date DESC, o.id DESC
-    ''', (phone,))
+    '''
+    if limit:
+        q += f" LIMIT {limit}"
+
+    cur.execute(q, (phone,))
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
     orders = {}
-    for row in rows:
-        oid = row["id"]
+    for r in rows:
+        oid = r["id"]
         if oid not in orders:
-            orders[oid] = {"date": row["order_date"], "notes": row["notes"] or "", "items": []}
-        orders[oid]["items"].append({"product": row["product"], "qty": row["quantity"]})
+            orders[oid] = {"date": r["order_date"], "items": [], "total": 0}
+        orders[oid]["items"].append({"product": r["name"], "qty": r["quantity"]})
+        orders[oid]["total"] += (r["price"] or 0) * r["quantity"]
+
     return list(orders.values())
 
 def get_all_products():
@@ -99,6 +124,261 @@ def login_required(f):
             return f(*args, **kwargs)
         return redirect("/login")
     return wrapper
+
+@lru_cache(maxsize=1)
+def get_all_products():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM products ORDER BY id")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return [dict(r) for r in rows]
+
+# ── ANALYTICS HELPERS ─────────────────────────
+
+def get_sales_by_product(start, end):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT p.name, SUM(oi.quantity) as total
+        FROM order_items oi
+        JOIN orders o ON oi.order_id=o.id
+        JOIN products p ON oi.product_id=p.id
+        WHERE o.order_date BETWEEN %s AND %s
+        GROUP BY p.name
+    """,(start,end))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def get_top_customers(start, end):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT c.name, COUNT(*) as cnt
+        FROM orders o
+        JOIN customers c ON o.phone=c.phone
+        WHERE o.order_date BETWEEN %s AND %s
+        GROUP BY c.name
+        ORDER BY cnt DESC
+        LIMIT 10
+    """,(start,end))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+# frequency detection (efficient: compute once per dashboard load)
+def get_customer_frequencies():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT phone, order_date
+        FROM orders
+        ORDER BY phone, order_date
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    from collections import defaultdict
+    data = defaultdict(list)
+
+    for r in rows:
+        data[r["phone"]].append(r["order_date"])
+
+    result = []
+    today = datetime.today().date()
+
+    for phone, dates in data.items():
+        if len(dates) < 2:
+            continue
+
+        diffs = [(dates[i]-dates[i-1]).days for i in range(1,len(dates))]
+        avg = sum(diffs)/len(diffs)
+
+        last = dates[-1]
+        expected = last + timedelta(days=round(avg))
+
+        if expected == today:
+            cust = get_customer(phone)
+            result.append({
+                "name": cust["name"] if cust else phone,
+                "freq": round(avg)
+            })
+
+    return result
+
+def get_today_revenue():
+    today = datetime.today().date()
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # orders
+    cur.execute("""
+        SELECT SUM(p.price * oi.quantity)
+        FROM order_items oi
+        JOIN orders o ON oi.order_id=o.id
+        JOIN products p ON oi.product_id=p.id
+        WHERE o.order_date=%s
+    """,(today,))
+    orders = cur.fetchone()[0] or 0
+
+    # cash
+    cur.execute("""
+        SELECT SUM(amount) FROM cash_payments
+        WHERE DATE(created_at)=%s
+    """,(today,))
+    cash = cur.fetchone()[0] or 0
+
+    cur.close(); conn.close()
+
+    return orders, cash
+
+# weather
+def get_weather(start, end):
+    data = {}
+    cur = datetime.strptime(start,"%Y-%m-%d")
+    endd = datetime.strptime(end,"%Y-%m-%d")
+
+    while cur <= endd:
+        url = f"https://api.openweathermap.org/data/2.5/weather?q=London&appid={WEATHER_API}&units=metric"
+        r = requests.get(url).json()
+        data[cur.strftime("%Y-%m-%d")] = r.get("main",{}).get("temp")
+        cur += timedelta(days=1)
+
+    return data
+
+def get_weather_forecast(days=3):
+    lat, lon = 51.5072, -0.1276
+
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": "temperature_2m_mean",
+        "forecast_days": days,
+        "timezone": "Europe/London"
+    }
+
+    r = requests.get(url, params=params).json()
+
+    dates = r.get("daily", {}).get("time", [])
+    temps = r.get("daily", {}).get("temperature_2m_mean", [])
+
+    return dict(zip(dates, temps))
+
+def get_daily_sales(start, end):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT o.order_date, SUM(oi.quantity) as total
+        FROM orders o
+        JOIN order_items oi ON o.id=oi.order_id
+        WHERE o.order_date BETWEEN %s AND %s
+        GROUP BY o.order_date
+        ORDER BY o.order_date
+    """,(start,end))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def get_weather_range(start, end):
+    # London coords
+    lat, lon = 51.5072, -0.1276
+
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start,
+        "end_date": end,
+        "daily": "temperature_2m_mean",
+        "timezone": "Europe/London"
+    }
+
+    r = requests.get(url, params=params).json()
+
+    data = {}
+    dates = r.get("daily", {}).get("time", [])
+    temps = r.get("daily", {}).get("temperature_2m_mean", [])
+
+    for d, t in zip(dates, temps):
+        data[d] = t
+
+    return data
+
+# ── NEW: NEXT 3 DAYS PREDICTION ───────────────
+
+def predict_next_calls(days=3):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT phone, order_date
+        FROM orders
+        ORDER BY phone, order_date
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    from collections import defaultdict
+    data = defaultdict(list)
+
+    for r in rows:
+        data[r["phone"]].append(r["order_date"])
+
+    predictions = {i: [] for i in range(days)}
+    today = datetime.today().date()
+
+    for phone, dates in data.items():
+        if len(dates) < 2:
+            continue
+
+        diffs = [(dates[i]-dates[i-1]).days for i in range(1,len(dates))]
+        avg = round(sum(diffs)/len(diffs))
+
+        next_date = dates[-1] + timedelta(days=avg)
+
+        for i in range(days):
+            if next_date == today + timedelta(days=i):
+                cust = get_customer(phone)
+                predictions[i].append(cust["name"] if cust else phone)
+
+    return predictions
+
+# ── NEW: INVENTORY DEPLETION ───────────────
+
+def get_inventory_status():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT p.name,
+               COALESCE(i.quantity,0) as stock,
+               COALESCE(SUM(oi.quantity),0) as sold_last_week
+        FROM products p
+        LEFT JOIN inventory i ON p.id=i.product_id
+        LEFT JOIN order_items oi ON p.id=oi.product_id
+        LEFT JOIN orders o ON oi.order_id=o.id
+            AND o.order_date >= CURRENT_DATE - INTERVAL '7 days'
+        GROUP BY p.name, i.quantity
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    result = []
+    for r in rows:
+        if r["sold_last_week"] > 0:
+            days_left = (r["stock"] / r["sold_last_week"]) * 7
+        else:
+            days_left = None
+
+        result.append({
+            "name": r["name"],
+            "stock": r["stock"],
+            "days_left": round(days_left,1) if days_left else None
+        })
+
+    return result
 
 # ── Shared HTML assets ────────────────────────────────────────────────────────
 
@@ -252,6 +532,8 @@ NAV = """
 <nav>
   <a class="logo" href="/">Sleemans</a>
   <a href="/search">Customers</a>
+  <a href="/cash">Cash</a>
+  <a href="/inventory">Inventory</a>
   <a href="#" onclick="toggleTheme()" id="theme-icon">&#9728;</a>
 </nav>
 """
@@ -313,58 +595,66 @@ def login():
 @app.route("/lookup")
 @login_required
 def lookup():
-    raw   = request.args.get("phone", "")
+    raw = request.args.get("phone", "")
     phone = normalize_phone(raw)
-    user  = get_customer(phone) if phone else None
-    orders = get_orders(phone) if phone else []
 
-    if not phone:
-        body = f'<div class="unknown-banner"><h2>Invalid number</h2><p class="meta" style="margin-top:6px">{raw}</p></div>'
+    user = get_customer(phone)
+    orders = get_orders(phone, limit=5)
+    products = get_all_products()
 
-    elif not user:
-        body = f'''<div class="unknown-banner">
-        <h2>Unknown caller</h2>
-        <p class="meta" style="margin-top:6px">{phone}</p>
-        <div style="margin-top:16px;display:flex;gap:10px">
-            <a href="/add_customer?phone={phone}" class="btn btn-primary">+ Add Customer</a>
-            <a href="/order?phone={phone}" class="btn btn-ghost">+ Add Order Anyway</a>
+    if not user:
+        return redirect(f"/add_customer?phone={phone}")
+
+    # LEFT: orders
+    order_html = ""
+    for o in orders:
+        items = ", ".join([f'{i["product"]} x{i["qty"]}' for i in o["items"]])
+        order_html += f"<div>{o['date']} — {items} — £{o['total']}</div>"
+
+    # RIGHT: order UI
+    tiles = ""
+    for p in products:
+        tiles += f'''
+        <div onclick="addQty({p["id"]})">
+            {p["name"]} (£{p["price"]})
+            <span id="q{p["id"]}"></span>
         </div>
-        </div>'''
+        '''
 
-    else:
-        initial = (user['name'] or '?')[0].upper()
-        gas_line = f'<div class="meta" style="margin-top:4px;color:var(--accent)">Usual: {user["gas_request"]}</div>' if user.get('gas_request') and str(user['gas_request']) not in ('nan', '') else ''
+    body = f'''
+    <h2>{user["name"]} ({phone})</h2>
 
-        if orders:
-            order_cards = ""
-            for o in orders:
-                tags = "".join(f'<span class="order-item-tag">{i["product"]}<span>x{i["qty"]}</span></span>' for i in o["items"])
-                order_cards += f'<div class="order-card"><div class="order-date">{o["date"]}</div><div class="order-items">{tags}</div></div>'
-        else:
-            order_cards = '<div class="empty">No previous orders on record.</div>'
-
-        body = f'''
-        <div class="customer-hero">
-          <div class="avatar">{initial}</div>
-          <div class="info">
-            <h2>{user["name"]} <span class="badge">{phone}</span></h2>
-            <div class="meta">{user.get("address","")} &middot; {user.get("town","")} &middot; {user.get("postcode","")}</div>
-            {gas_line}
-          </div>
-          <div style="margin-left:auto;display:flex;gap:8px">
-            <a href="/edit_customer?phone={phone}" class="btn btn-ghost">Edit</a>
-            <a href="/order?phone={phone}" class="btn btn-primary">+ Add Order</a>
-          </div>
+    <div style="display:flex;gap:40px">
+        <div style="width:50%">
+            <h3>Last Orders</h3>
+            {order_html or "No orders"}
         </div>
 
-        <div class="section-header" style="margin-top:32px">
-          <h3>Order History</h3>
-          <span class="pill">{len(orders)} orders</span>
+        <div style="width:50%">
+            <h3>Add Order</h3>
+            <form method="POST" action="/save_order">
+                <input type="hidden" name="phone" value="{phone}">
+                <input type="date" name="date" value="{datetime.today().date()}">
+                <div>{tiles}</div>
+                <input type="hidden" name="items" id="items">
+                <button onclick="prep()">Save</button>
+            </form>
         </div>
-        <div class="order-list">{order_cards}</div>'''
+    </div>
 
-    return page("Lookup", body)
+    <script>
+    let items = {{}}
+    function addQty(id){{
+        items[id] = (items[id]||0)+1
+        document.getElementById("q"+id).innerText = items[id]
+    }}
+    function prep(){{
+        document.getElementById("items").value = JSON.stringify(items)
+    }}
+    </script>
+    '''
 
+    return body
 
 @app.route("/order")
 @login_required
@@ -440,33 +730,49 @@ def order_page():
 @app.route("/save_order", methods=["POST"])
 @login_required
 def save_order():
-    phone_raw = request.form.get("phone", "")
-    phone     = normalize_phone(phone_raw) or phone_raw
-    date      = request.form.get("date") or str(datetime.today().date())
+    phone = normalize_phone(request.form.get("phone"))
+    date = request.form.get("date") or str(datetime.today().date())
 
     try:
         items = json.loads(request.form.get("items", "{}"))
-    except Exception:
+    except:
         items = {}
 
     if not items:
-        return redirect(f"/order?phone={phone}")
+        return redirect(f"/lookup?phone={phone}")
 
     conn = get_db()
     cur = conn.cursor()
+
     if not get_customer(phone):
         cur.execute("INSERT INTO customers (phone, name) VALUES (%s, %s)", (phone, "Unknown"))
-    cur.execute("INSERT INTO orders (phone, order_date) VALUES (%s, %s) RETURNING id", (phone, date))
+
+    cur.execute(
+        "INSERT INTO orders (phone, order_date) VALUES (%s,%s) RETURNING id",
+        (phone, date)
+    )
     oid = cur.fetchone()[0]
 
     for pid, qty in items.items():
-        cur.execute("INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s, %s, %s)", (oid, int(pid), int(qty)))
+        pid, qty = int(pid), int(qty)
+
+        cur.execute(
+            "INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s,%s,%s)",
+            (oid, pid, qty)
+        )
+
+        # NEW: inventory deduction
+        cur.execute("""
+            UPDATE inventory
+            SET quantity = COALESCE(quantity,0) - %s
+            WHERE product_id=%s
+        """,(qty, pid))
 
     conn.commit()
     cur.close()
     conn.close()
-    return redirect(f"/lookup?phone={phone}")
 
+    return redirect(f"/lookup?phone={phone}")
 
 @app.route("/search")
 @login_required
@@ -533,11 +839,17 @@ def search():
     document.querySelectorAll("#table-body tr").forEach(r => {{
         const name = r.dataset.name || "";
         const phone = r.dataset.phone || "";
+        const altPhone = phone.replace("+44","0");  
         const addr = r.dataset.address || "";
         const postcode = r.dataset.postcode || "";
         const gas = r.dataset.gas || "";
 
-        const matchGeneral = name.includes(q) || phone.includes(q) || addr.includes(q) || postcode.includes(q);
+        const matchGeneral =
+          name.includes(q) ||
+          phone.includes(q) ||
+          altPhone.includes(q) ||
+          addr.includes(q) ||
+          postcode.includes(q);
         const matchGas = gas.includes(gasQ);
 
         r.style.display = (matchGeneral && matchGas) ? "" : "none";
@@ -617,9 +929,12 @@ def edit_customer():
     phone = normalize_phone(request.args.get("phone"))
 
     if request.method == "POST":
-        phone = normalize_phone(request.form.get("phone"))
+        if "cancel" in request.form:
+            return redirect(f"/lookup?phone={phone}")
+
         conn = get_db()
         cur = conn.cursor()
+
         cur.execute('''
             UPDATE customers
             SET name=%s, address=%s, town=%s, postcode=%s, gas_request=%s
@@ -632,29 +947,139 @@ def edit_customer():
             request.form.get("gas_request"),
             phone
         ))
+
         conn.commit()
         cur.close()
         conn.close()
+
         return redirect(f"/lookup?phone={phone}")
 
     user = get_customer(phone)
 
     body = f'''
-    <h1 style="margin-bottom:24px">Edit Customer</h1>
+    <h1>Edit Customer</h1>
     <div class="card">
       <form method="POST">
         <input type="hidden" name="phone" value="{phone}">
-        <div class="form-group"><label>Name</label><input type="text" name="name" value="{user.get("name","")}"></div>
-        <div class="form-group"><label>Address</label><input type="text" name="address" value="{user.get("address","")}"></div>
-        <div class="form-group"><label>Town</label><input type="text" name="town" value="{user.get("town","")}"></div>
-        <div class="form-group"><label>Postcode</label><input type="text" name="postcode" value="{user.get("postcode","")}"></div>
-        <div class="form-group"><label>Usual Gas Request</label><input type="text" name="gas_request" value="{user.get("gas_request","")}"></div>
+        <input name="name" value="{user.get("name","")}">
+        <input name="address" value="{user.get("address","")}">
+        <input name="town" value="{user.get("town","")}">
+        <input name="postcode" value="{user.get("postcode","")}">
+        <input name="gas_request" value="{user.get("gas_request","")}">
 
-        <button class="btn btn-primary">Save</button>
+        <button name="save">Save</button>
+        <button name="cancel">Cancel</button>
       </form>
     </div>
     '''
     return page("Edit Customer", body)
+
+@app.route("/analytics")
+@login_required
+def analytics():
+    start = request.args.get("start") or (datetime.today()-timedelta(days=7)).strftime("%Y-%m-%d")
+    end = request.args.get("end") or datetime.today().strftime("%Y-%m-%d")
+
+    daily = get_daily_sales(start,end)
+    weather = get_weather_range(start,end)
+    top = get_top_customers(start,end)
+    preds = predict_next_calls(3)
+    inventory = get_inventory_status()
+    orders_rev, cash_rev = get_today_revenue()
+
+    dates = [str(r["order_date"]) for r in daily]
+    sales = [r["total"] for r in daily]
+    temps = [round(weather.get(d, 0), 1) for d in dates]
+
+    body = f"""
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <h1>Analytics</h1>
+
+    <form>
+        <input type="date" name="start" value="{start}">
+        <input type="date" name="end" value="{end}">
+        <button>Apply</button>
+    </form>
+
+    <div class="card">
+        <h3>Sales vs Weather</h3>
+        <canvas id="combo"></canvas>
+    </div>
+
+    <div class="card">
+        <h3>Top Customers</h3>
+        <canvas id="customers"></canvas>
+    </div>
+
+    <div class="card">
+        <h3>Expected Calls</h3>
+        <div>Today: {', '.join(preds[0]) or 'None'}</div>
+        <div>Tomorrow: {', '.join(preds[1]) or 'None'}</div>
+        <div>Day After: {', '.join(preds[2]) or 'None'}</div>
+    </div>
+
+    <div class="card">
+        <h3>Inventory Depletion</h3>
+        {"".join([f"<div>{i['name']} → {i['stock']} left (~{i['days_left']} days)</div>" for i in inventory])}
+    </div>
+
+    <div class="card">
+        <h3>Revenue Today</h3>
+        <canvas id="revenue"></canvas>
+    </div>
+
+    <script>
+    new Chart(document.getElementById('combo'), {{
+        data: {{
+            labels: {json.dumps(dates)},
+            datasets: [
+                {{
+                    type: 'bar',
+                    label: 'Gas Sold',
+                    data: {json.dumps(sales)},
+                    yAxisID: 'y'
+                }},
+                {{
+                    type: 'line',
+                    label: 'Temp (°C)',
+                    data: {json.dumps(temps)},
+                    yAxisID: 'y1'
+                }}
+            ]
+        }},
+        options: {{
+            scales: {{
+                y: {{ beginAtZero: true }},
+                y1: {{ position: 'right' }}
+            }}
+        }}
+    }});
+
+    new Chart(document.getElementById('customers'), {{
+        type: 'bar',
+        data: {{
+            labels: {json.dumps([r["name"] for r in top])},
+            datasets: [{{
+                label: 'Orders',
+                data: {json.dumps([r["cnt"] for r in top])}
+            }}]
+        }}
+    }});
+
+    new Chart(document.getElementById('revenue'), {{
+        type: 'pie',
+        data: {{
+            labels: ['Orders','Cash'],
+            datasets: [{{
+                data: [{orders_rev},{cash_rev}]
+            }}]
+        }}
+    }});
+    </script>
+    """
+
+    return page("Analytics", body, wide=True)
 
 @app.route("/api/orders")
 @login_required
