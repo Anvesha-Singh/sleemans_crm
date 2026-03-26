@@ -49,14 +49,22 @@ def normalize_phone(phone):
     return f"+{digits[:12]}" if digits.startswith('+44') else f"+{digits}"
 
 def get_customer(phone):
-    """Fetch customer by normalized phone number."""
-    phone_norm = normalize_phone(phone)
-    if not phone_norm:
+    """Fetch customer by phone, checking both +44 and 0 formats."""
+    if not phone:
         return None
+
+    phone_norm = normalize_phone(phone)
+    phone_alt  = None
+    if phone_norm.startswith("+44"):
+        phone_alt = "0" + phone_norm[3:]  # 0-prefixed version
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM customers WHERE phone = %s", (phone_norm,))
+    cur.execute("""
+        SELECT * FROM customers
+        WHERE phone = %s OR phone = %s
+        LIMIT 1
+    """, (phone_norm, phone_alt))
     row = cur.fetchone()
     cur.close()
     conn.close()
