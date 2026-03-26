@@ -88,7 +88,9 @@ def get_orders(phone, limit=None):
     for r in rows:
         oid = r["id"]
         if oid not in orders:
-            orders[oid] = {"date": r["order_date"], "items": [], "total": 0}
+            # ADD "id": oid HERE:
+            orders[oid] = {"id": oid, "date": r["order_date"], "items": [], "total": 0}
+        
         orders[oid]["items"].append({"product": r["name"], "qty": r["quantity"]})
         orders[oid]["total"] += (r["price"] or 0) * r["quantity"]
 
