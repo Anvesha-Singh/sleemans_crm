@@ -815,7 +815,7 @@ def search():
     document.querySelectorAll("#table-body tr").forEach(r => {{
         const name = r.dataset.name || "";
         const phone = r.dataset.phone || "";
-        const altPhone = phone.replace(/^0|^44|\\+/g,"");
+        const altPhone = phone.replace(/^0|^44|\+/g,"");
         const addr = r.dataset.address || "";
         const postcode = r.dataset.postcode || "";
         const gas = r.dataset.gas || "";
