@@ -61,6 +61,23 @@ def get_customer(phone):
     conn.close()
     return dict(row) if row else None
 
+def get_last_order_summary(phone):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT p.name, oi.quantity
+        FROM orders o
+        JOIN order_items oi ON o.id = oi.order_id
+        JOIN products p ON oi.product_id = p.id
+        WHERE o.phone=%s
+        ORDER BY o.order_date DESC, o.id DESC
+        LIMIT 5
+    """, (phone,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    return ", ".join([f"{r['name']} x{r['quantity']}" for r in rows]) if rows else ""
+
 def get_orders(phone, limit=None):
     """Fetch orders by cleaned 10-digit phone."""
     phone_clean = clean_phone(phone)
@@ -601,6 +618,7 @@ def lookup():
             tiles += f'''
             <div class="product-tile" id="tile-{p["id"]}" onclick="addQty({p["id"]})">
                 <div class="p-name">{p["name"]}</div>
+                <div style="font-size:.75rem;color:var(--muted)">£{p["price"]}</div>
                 <div class="p-qty" id="qty-{p["id"]}"></div>
                 <span class="p-reset" onclick="event.stopPropagation();resetTile({p["id"]})">&#x2715;</span>
             </div>
@@ -610,7 +628,7 @@ def lookup():
         <div class="customer-hero">
           <div class="avatar">{initial}</div>
           <div class="info">
-            <h2>{user["name"]} <span class="badge">{phone}</span></h2>
+            <h2>{user["name"]} <span class="badge">0{phone}</span></h2>
             <div class="meta">{user.get("address","")} &middot; {user.get("town","")} &middot; {user.get("postcode","")}</div>
           </div>
           <div style="margin-left:auto">
@@ -736,6 +754,7 @@ def save_order():
 @app.route("/search")
 @login_required
 def search():
+    last_order = get_last_order_summary(phone)
     customers = get_all_customers()
 
     rows = ""
@@ -759,9 +778,9 @@ def search():
               {name}
             </div>
           </td>
-          <td><span class="pill">{phone}</span></td>
+          <td><span class="pill">0{phone}</span></td>
           <td style="color:var(--muted);font-size:.82rem">{u.get('address','')}, {town}, {postcode}</td>
-          <td style="color:var(--muted);font-size:.82rem">{gas_disp}</td>
+          <td style="color:var(--muted);font-size:.82rem">{last_order}</td>
           <td>
             <a href="/lookup?phone={phone}" class="btn btn-ghost" style="padding:6px 12px;font-size:.78rem">View</a>
           </td>
@@ -782,7 +801,7 @@ def search():
 
     <div class="card" style="padding:0;overflow:hidden">
       <table>
-        <thead><tr><th>Name</th><th>Phone</th><th>Location</th><th>Usual Gas</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Name</th><th>Phone</th><th>Location</th><th>Last Order</th><th>Actions</th></tr></thead>
         <tbody id="table-body">{rows}</tbody>
       </table>
       {'<div class="empty">No customers yet. Run setup_db.py with your Excel file.</div>' if not customers else ''}
@@ -796,7 +815,7 @@ def search():
     document.querySelectorAll("#table-body tr").forEach(r => {{
         const name = r.dataset.name || "";
         const phone = r.dataset.phone || "";
-        const altPhone = phone.replace(/^0|^44|\+/g,"");
+        const altPhone = phone.replace(/^0|^44|\\+/g,"");
         const addr = r.dataset.address || "";
         const postcode = r.dataset.postcode || "";
         const gas = r.dataset.gas || "";
