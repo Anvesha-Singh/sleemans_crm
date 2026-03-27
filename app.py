@@ -40,7 +40,7 @@ def clean_phone(phone):
     """Strip non-digit chars and remove leading 0 or 44."""
     if not phone:
         return None
-    digits = re.sub(r'\D', '', str(phone))
+    digits = re.sub(r'\+', '', phone) 
     if digits.startswith('0'):
         digits = digits[1:]
     elif digits.startswith('44'):
@@ -549,6 +549,8 @@ def login():
 @login_required
 def lookup():
     print("LOOKUP HIT:", datetime.now(), request.args)
+    if "Vonage" in request.headers.get("User-Agent", ""):
+        return "OK"
     raw = request.args.get("phone","")
     phone = clean_phone(raw)
 
