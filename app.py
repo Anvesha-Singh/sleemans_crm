@@ -98,15 +98,6 @@ def get_orders(phone, limit=None):
 
     return list(orders.values())
 
-def get_all_products():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM products ORDER BY id")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [dict(r) for r in rows]
-
 def get_all_customers():
     conn = get_db()
     cur = conn.cursor()
@@ -557,6 +548,7 @@ def login():
 @app.route("/lookup")
 @login_required
 def lookup():
+    print("LOOKUP HIT:", datetime.now(), request.args)
     raw = request.args.get("phone","")
     phone = clean_phone(raw)
 
