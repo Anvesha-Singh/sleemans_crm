@@ -754,6 +754,7 @@ def save_order():
 @app.route("/search")
 @login_required
 def search():
+    phone = u.get('phone', '') or ''
     last_order = get_last_order_summary(phone)
     customers = get_all_customers()
 
