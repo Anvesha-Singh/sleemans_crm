@@ -61,22 +61,24 @@ def get_customer(phone):
     conn.close()
     return dict(row) if row else None
 
-def get_last_order_summary(phone):
+def get_last_orders_bulk():
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute("""
-        SELECT p.name, oi.quantity
+        SELECT DISTINCT ON (o.phone)
+            o.phone,
+            STRING_AGG(p.name || ' x' || oi.quantity, ', ') as summary
         FROM orders o
         JOIN order_items oi ON o.id = oi.order_id
         JOIN products p ON oi.product_id = p.id
-        WHERE o.phone=%s
-        ORDER BY o.order_date DESC, o.id DESC
-        LIMIT 5
-    """, (phone,))
+        ORDER BY o.phone, o.order_date DESC, o.id DESC
+    """)
+
     rows = cur.fetchall()
     cur.close(); conn.close()
 
-    return ", ".join([f"{r['name']} x{r['quantity']}" for r in rows]) if rows else ""
+    return {r["phone"]: r["summary"] for r in rows}
 
 def get_orders(phone, limit=None):
     """Fetch orders by cleaned 10-digit phone."""
@@ -755,9 +757,10 @@ def save_order():
 @login_required
 def search():
     customers = get_all_customers()
+    last_orders_map = get_last_orders_bulk()
     for u in customers:
         phone = u.get('phone', '') or ''
-        last_order = get_last_order_summary(phone)
+        last_order = last_orders_map.get(phone, "")
 
     rows = ""
     for u in customers:
