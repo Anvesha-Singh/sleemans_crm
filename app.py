@@ -145,7 +145,7 @@ def login_required(f):
 def get_all_products():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM products ORDER BY sort_order ASC, name ASC")
+    cur.execute("SELECT * FROM products WHERE is_active = TRUE ORDER BY sort_order ASC, name ASC")
     rows = cur.fetchall()
     cur.close(); conn.close()
     return [dict(r) for r in rows]
@@ -800,7 +800,7 @@ def deliveries():
     """, (target_date,))
     delivered_map = {str(r['id']): r['qty'] for r in cur.fetchall()}
     
-    # Fetch Orders (FIXED SYNTAX ERROR HERE)
+    # Fetch Orders
     cur.execute("""
         SELECT o.id, c.name, c.phone, c.address, c.town, c.postcode, o.notes, o.is_paid,
                STRING_AGG(oi.quantity || ' x ' || COALESCE(oi.custom_name, p.name), ', ') as items
@@ -815,13 +815,14 @@ def deliveries():
     rows = cur.fetchall()
     cur.close(); conn.close()
 
+    # Replaced "Paid" with a Checkmark (✓), blank if Unpaid
     tr = "".join(f'''
-        <tr style="font-size: 9pt;">
-            <td style="padding:4px 8px;"><strong>{r['name']}</strong><br><span style="font-family:'DM Mono',monospace; font-size:8pt;">0{r['phone']}</span></td>
-            <td style="padding:4px 8px;">{r['address']}<br>{r['town']}, {r['postcode']}</td>
-            <td style="padding:4px 8px; font-weight:bold; color:var(--accent); font-size:8.5pt;">{r['items']}</td>
-            <td style="padding:4px 8px; font-weight:bold;">{"Paid" if r['is_paid'] else "Unpaid"}</td>
-            <td style="padding:4px 8px; font-size:8pt;">{r['notes'] or ''}</td>
+        <tr>
+            <td><strong>{r['name']}</strong><br><span style="font-family:'DM Mono',monospace;">0{r['phone']}</span></td>
+            <td>{r['address']}<br>{r['town']}, {r['postcode']}</td>
+            <td style="font-weight:bold; color:var(--accent);">{r['items']}</td>
+            <td style="text-align:center; font-weight:bold; font-size:12pt;">{"✓" if r['is_paid'] else ""}</td>
+            <td>{r['notes'] or ''}</td>
         </tr>
     ''' for r in rows)
 
@@ -832,12 +833,11 @@ def deliveries():
     
     matrix_headers_2 = "<td></td>"
     for p in butane + propane:
-        matrix_headers_2 += f"<td style='font-weight:bold; text-align:center; font-size:9pt;'>{p['display_name'] or p['name']}</td>"
+        matrix_headers_2 += f"<td style='font-weight:bold; text-align:center;'>{p['display_name'] or p['name']}</td>"
 
-    row_out = "<td><strong>Out</strong></td>" + "".join("<td></td>" for _ in butane + propane)
+    # Removed "Out" row completely as requested
     row_in = "<td><strong>In</strong></td>" + "".join("<td></td>" for _ in butane + propane)
-    
-    row_delivered = "<td><strong>To Deliver</strong></td>"
+    row_delivered = "<td><strong>Out</strong></td>"
     row_truck = "<td><strong>Total on Truck</strong></td>"
     row_net = "<td><strong>Net Wt (tons)</strong></td>"
     row_gross = "<td><strong>Gross Wt (tons)</strong></td>"
@@ -857,32 +857,34 @@ def deliveries():
     body = f'''
     <style>
     @media print {{
-        @page {{ size: landscape; margin: 0mm; }}
-        body {{ background: white !important; color: black !important; padding: 15mm !important; }}
+        /* Enable browser margin so native page numbers print */
+        @page {{ size: landscape; margin: 10mm; }}
+        body {{ background: white !important; color: black !important; }}
         nav, .no-print {{ display: none !important; }}
         .print-only {{ display: block !important; }}
-        .card {{ border: none !important; padding: 0 !important; background: transparent !important; box-shadow: none !important; margin-bottom: 10px !important; }}
-        table {{ border: 1px solid #000 !important; width: 100%; border-collapse: collapse; }}
-        th, td {{ border: 1px solid #000 !important; color: black !important; }}
+        .print-table-row {{ display: table-row !important; }}
+        
+        /* Enforce exact uniform font sizing on paper */
+        * {{ font-size: 10pt !important; }}
+        h2 {{ font-size: 14pt !important; margin: 0 0 10px 0 !important; }}
+        
+        .card {{ border: none !important; padding: 0 !important; background: transparent !important; box-shadow: none !important; margin-bottom: 20px !important; }}
+        table {{ border: 1px solid #000 !important; width: 100%; border-collapse: collapse; page-break-inside: auto; }}
+        tr {{ page-break-inside: avoid; page-break-after: auto; }}
+        th, td {{ border: 1px solid #000 !important; color: black !important; padding: 6px !important; vertical-align: middle; }}
         .matrix-input {{ border: none !important; background: transparent !important; width: 100%; text-align: center; font-weight: bold; padding:0; }}
-        td, th {{ font-size: 9pt; padding: 4px !important; }}
-        .footer-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; font-size: 8pt; line-height: 1.3; margin-top: 15px; page-break-inside: avoid; }}
-        .footer-box {{ border: 1px solid #000; padding: 8px; }}
+        
+        /* Static Footer Styling */
+        .footer-container {{ border: 2px solid #000; padding: 10px; margin-top: 20px; page-break-inside: avoid; }}
+        .footer-grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; border-bottom: 1px dashed #000; padding-bottom: 10px; margin-bottom: 10px; }}
+        .footer-grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px; }}
     }}
     .matrix-input {{ width: 60px; padding: 4px; text-align: center; border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 4px; }}
+    .print-only, .print-table-row {{ display: none; }}
     </style>
     
     <div class="no-print" style="margin-bottom: 24px;">
         <h1 style="margin-bottom:16px;">Deliveries / Run Sheet</h1>
-    </div>
-
-    <div class="print-only" style="display:none; margin-bottom:10px;">
-        <h2 style="margin:0 0 5px 0;">Delivery Run Sheet</h2>
-        <div style="font-size: 11pt; font-weight: bold; display:flex; justify-content:space-between;">
-            <span>Date: {target_date}</span>
-            <span>Driver: <span id="print_driver"></span></span>
-            <span>Vehicle: <span id="print_vehicle"></span></span>
-        </div>
     </div>
 
     <form id="run-form" action="/export_delivery_excel" method="GET">
@@ -915,7 +917,17 @@ def deliveries():
         <div class="card" style="padding:0;overflow:hidden; margin-bottom:16px;">
             <table>
                 <thead style="background:var(--surface)">
-                    <tr><th>Customer</th><th>Address</th><th>Order Items</th><th>Status</th><th>Notes</th></tr>
+                    <tr class="print-table-row">
+                        <td colspan="5" style="border:none !important; border-bottom:2px solid #000 !important; padding-bottom:10px !important;">
+                            <h2 style="margin:0 0 5px 0;">Delivery Run Sheet</h2>
+                            <div style="font-weight: bold; display:flex; justify-content:space-between;">
+                                <span>Date: {target_date}</span>
+                                <span>Driver: <span id="print_driver"></span></span>
+                                <span>Vehicle: <span id="print_vehicle"></span></span>
+                            </div>
+                        </td>
+                    </tr>
+                    <tr><th>Customer</th><th>Address</th><th>Order Items</th><th>Paid</th><th>Notes</th></tr>
                 </thead>
                 <tbody>
                     {tr or '<tr><td colspan="5" style="text-align:center;padding:20px;">No deliveries.</td></tr>'}
@@ -930,7 +942,6 @@ def deliveries():
                     <tr style="background:var(--surface); border-bottom: 2px solid var(--border);">{matrix_headers_2}</tr>
                 </thead>
                 <tbody>
-                    <tr>{row_out}</tr>
                     <tr>{row_in}</tr>
                     <tr style="background:var(--surface)">{row_delivered}</tr>
                     <tr>{row_truck}</tr>
@@ -945,29 +956,33 @@ def deliveries():
         </div>
     </form>
     
-    <div class="print-only footer-grid" style="display:none;">
-        <div class="footer-box">
-            <strong>SHIPPING NAME:</strong> PROPANE and/or BUTANE<br>
-            <strong>CLASSIFICATION:</strong> CLASS 2.1<br>
-            <strong>UN NUMBER/S:</strong> UN 1978 (PROPANE) & UN 1011 (BUTANE)<br>
-            <strong>TRANSPORT CATEGORY:</strong> CATEGORY 2 'EXTREMELY FLAMMABLE'
+    <div class="print-only footer-container">
+        <div class="footer-grid-3">
+            <div>
+                <strong>SHIPPING NAME:</strong> PROPANE and/or BUTANE<br>
+                <strong>CLASSIFICATION:</strong> CLASS 2.1<br>
+                <strong>UN NUMBER/S:</strong> UN 1978 (PROPANE) & UN 1011 (BUTANE)<br>
+                <strong>TRANSPORT CATEGORY:</strong> CATEGORY 2 'EXTREMELY FLAMMABLE'
+            </div>
+            <div>
+                <strong>CONSIGNOR:</strong> FLO GAS Ltd<br>
+                <strong>CONSIGNEE:</strong> AS Per delivery address shown above<br>
+                <strong>QUANTITIES:</strong> AS Per quantities on customer address<br>
+                <strong>EMERGENCY ACTION CODE:</strong> 2YE
+            </div>
+            <div style="text-align:center;">
+                <strong>SLEEMANS</strong><br>
+                154 SWINDON RD<br>
+                STRATTON SWINDON WILTS.<br>
+                SN3 4PN &nbsp;&nbsp;|&nbsp;&nbsp; phone 01793 822087
+            </div>
         </div>
-        <div class="footer-box">
-            <strong>CONSIGNOR:</strong> FLO GAS Ltd<br>
-            <strong>CONSIGNEE:</strong> AS Per delivery address shown above<br>
-            <strong>QUANTITIES:</strong> AS Per quantities on customer address<br>
-            <strong>EMERGENCY ACTION CODE:</strong> 2YE
-        </div>
-        <div class="footer-box" style="text-align:center;">
-            <strong>SLEEMANS</strong><br>
-            154 SWINDON RD<br>
-            STRATTON SWINDON WILTS.<br>
-            SN3 4PN &nbsp;&nbsp;|&nbsp;&nbsp; phone 01793 822087
-        </div>
-        <div class="footer-box" style="display:flex; flex-direction:column; justify-content:space-between;">
-            <div>THERE ARE NO TEMPERATURE CONTROL CONSIDERATIONS.</div>
-            <div style="margin-top:15px; border-top:1px dashed #000; padding-top:5px;">
-                FOR OR ON BEHALF OF CONSIGNOR (Signature):
+        
+        <div>
+            <div style="font-weight:bold; margin-bottom: 10px;">THERE ARE NO TEMPERATURE CONTROL CONSIDERATIONS.</div>
+            <div class="footer-grid-2">
+                <div style="border-top: 1px solid #000; padding-top: 5px;">FOR OR ON BEHALF OF CONSIGNOR: Signature:</div>
+                <div style="border-top: 1px solid #000; padding-top: 5px;">DRIVER SIGNATURE:</div>
             </div>
         </div>
     </div>
@@ -1011,8 +1026,15 @@ def deliveries():
     calcMatrix();
 
     function triggerPrint() {{
-        document.getElementById('print_driver').innerText = document.getElementById('driver_input').value;
-        document.getElementById('print_vehicle').innerText = document.getElementById('vehicle_input').value;
+        // Populate the repeating print headers
+        const drivers = document.querySelectorAll('#print_driver');
+        const vehicles = document.querySelectorAll('#print_vehicle');
+        const selDriver = document.getElementById('driver_input').value;
+        const selVehicle = document.getElementById('vehicle_input').value;
+        
+        drivers.forEach(d => d.innerText = selDriver);
+        vehicles.forEach(v => v.innerText = selVehicle);
+        
         window.print();
     }}
     </script>
@@ -1799,16 +1821,26 @@ def inventory():
 
         if "delete_pid" in request.form:
             pid = request.form["delete_pid"]
-            cur.execute("DELETE FROM inventory WHERE product_id=%s", (pid,))
-            cur.execute("DELETE FROM products WHERE id=%s", (pid,))
+            try:
+                # 1. Attempt a complete physical delete (Works for untouched mistakes)
+                cur.execute("DELETE FROM inventory WHERE product_id=%s", (pid,))
+                cur.execute("DELETE FROM products WHERE id=%s", (pid,))
+                conn.commit() 
+            except Exception:
+                # 2. If Postgres blocks it due to historical receipts, gracefully Archive it instead
+                conn.rollback() # Reset the transaction
+                cur.execute("UPDATE products SET is_active = FALSE WHERE id=%s", (pid,))
+                cur.execute("DELETE FROM inventory WHERE product_id=%s", (pid,)) # Clear its remaining stock
 
         conn.commit()
         if hasattr(get_all_products, 'cache_clear'): get_all_products.cache_clear()
 
+    # Note the new `WHERE p.is_active = TRUE` filter here
     cur.execute("""
         SELECT p.id, p.name, p.display_name, p.price, p.color, COALESCE(p.net_weight,0) as net, COALESCE(p.gross_weight,0) as gross, p.gas_type, COALESCE(p.sort_order,0) as sort_order, COALESCE(i.quantity,0) as qty
         FROM products p
         LEFT JOIN inventory i ON p.id=i.product_id
+        WHERE p.is_active = TRUE
         ORDER BY p.sort_order ASC, p.name ASC
     """)
     rows = cur.fetchall()
@@ -1844,7 +1876,7 @@ def inventory():
         <form method="POST" style="margin:0">
             <table style="min-width: 1100px; font-size:0.95rem;">
                 <thead style="background:var(--surface)">
-                    <tr><th>Sort</th><th>Full Name</th><th>Display Pad</th><th>Gas Type</th><th>Price (£)</th><th>Qty</th><th>Net Wt</th><th>Gross Wt</th><th style="text-align:right">Actions</th></tr>
+                    <tr><th>Sort</th><th>Full Name</th><th>Display Pad</th><th>Gas Type</th><th>Price (£)</th><th>Qty</th><th>Net Wt</th><th>Gross Wt</th><th>Color</th><th style="text-align:right">Actions</th></tr>
                 </thead>
                 <tbody>{table_rows}</tbody>
             </table>
