@@ -215,10 +215,6 @@ def get_daily_sales(start, end):
     cur.close(); conn.close()
     return rows
 
-def get_weather(start, end):
-    # Kept for backward compatibility if needed elsewhere
-    return {}
-
 def get_weather_range(start, end):
     try:
         url = "https://api.open-meteo.com/v1/forecast"
@@ -394,6 +390,90 @@ def reload_cache():
     get_all_products.cache_clear()
     return redirect(request.referrer or "/search")
 
+@app.route("/api/optimize_route", methods=["POST"])
+@login_required
+def optimize_route():
+    data = request.json
+    postcodes = data.get("postcodes", [])
+    depot_postcode = "SN3 4PN"
+    
+    ORS_API_KEY = os.getenv("ORS_API_KEY")
+    if not ORS_API_KEY:
+        return jsonify({"error": "ORS_API_KEY is missing from environment variables."}), 400
+
+    try:
+        # 1. Translate UK Postcodes into GPS Coordinates (using free postcodes.io)
+        all_pcs = [depot_postcode] + postcodes
+        geo_req = requests.post("https://api.postcodes.io/postcodes", json={"postcodes": all_pcs})
+        geo_data = geo_req.json().get("result", [])
+
+        coords_map = {}
+        for item in geo_data:
+            if item and item.get("query") and item.get("result"):
+                # Clean spacing to ensure matches
+                pc_key = item["query"].replace(" ", "").upper()
+                coords_map[pc_key] = [item["result"]["longitude"], item["result"]["latitude"]]
+
+        depot_key = depot_postcode.replace(" ", "").upper()
+        if depot_key not in coords_map:
+            return jsonify({"error": "Could not locate depot coordinates."}), 400
+
+        # 2. Build the Jobs (Deliveries) payload for OpenRouteService
+        jobs = []
+        for i, pc in enumerate(postcodes):
+            pc_key = pc.replace(" ", "").upper()
+            if pc_key in coords_map:
+                jobs.append({
+                    "id": i + 1,
+                    "location": coords_map[pc_key],
+                    "description": pc # Store postcode to retrieve it later
+                })
+
+        if not jobs:
+            return jsonify({"error": "Could not geocode any of the delivery postcodes."}), 400
+
+        # 3. Ask ORS to mathematically optimize the route (Round trip from depot)
+        payload = {
+            "vehicles": [{
+                "id": 1,
+                "profile": "driving-car",
+                "start": coords_map[depot_key],
+                "end": coords_map[depot_key]
+            }],
+            "jobs": jobs
+        }
+
+        headers = {
+            "Authorization": ORS_API_KEY,
+            "Content-Type": "application/json"
+        }
+
+        ors_res = requests.post("https://api.openrouteservice.org/optimization", json=payload, headers=headers)
+        
+        if ors_res.status_code != 200:
+            return jsonify({"error": "OpenRouteService failed to calculate.", "details": ors_res.text}), 500
+
+        # 4. Extract the newly optimized order
+        routes = ors_res.json().get("routes", [])
+        if not routes:
+            return jsonify({"error": "No optimized route returned."}), 400
+
+        steps = routes[0].get("steps", [])
+        optimized_postcodes = []
+        
+        for step in steps:
+            if step.get("type") == "job":
+                job_id = step.get("job")
+                for j in jobs:
+                    if j["id"] == job_id:
+                        optimized_postcodes.append(j["description"])
+                        break
+
+        return jsonify({"optimized": optimized_postcodes})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -478,19 +558,18 @@ def lookup():
     tiles = ""
     for p in products:
         bg_color = p.get('color', 'var(--surface)')
-        
-        # Safely escape the full name for the Javascript function
-        safe_full_name = p["name"].replace("'", "\\'") 
-        
-        # Use display_name for the button if it exists, otherwise use the full name
+        safe_name = p["name"].replace("'", "\\'") 
         short_name = p.get("display_name") or p["name"] 
         
         tiles += f'''
-        <div class="product-tile" id="tile-{p["id"]}" style="background-color: {bg_color}; padding: 10px 6px;" onclick="addQty('{p["id"]}', '{safe_full_name}', {p["price"]})">
-            <div class="p-name" style="font-size:0.9rem;">{short_name}</div>
-            <div style="font-size:0.85rem;color:var(--muted);margin-top:2px;">£{p["price"]}</div>
-            <div class="p-qty" id="qty-{p["id"]}" style="font-size:1.4rem; min-height:1.6rem; margin-top:4px;"></div>
-            <span style="position:absolute;top:4px;right:4px;font-size:1.1rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:20px;height:20px;line-height:20px;" id="reset-{p["id"]}" onclick="event.stopPropagation();resetTile('{p["id"]}')">&#x2715;</span>
+        <div class="product-tile" id="tile-{p["id"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["id"]}', '{safe_name}', {p["price"]})">
+            <div class="p-name" style="font-size:1rem;">{short_name}</div>
+            <div style="font-size:0.9rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
+                £<span id="price-display-{p['id']}">{p["price"]}</span>
+                <span onclick="event.stopPropagation(); setCustomPrice('{p['id']}', {p['price']})" style="cursor:pointer; font-size:0.85rem;" title="Give Discount">✏️</span>
+            </div>
+            <div class="p-qty" id="qty-{p["id"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
+            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["id"]}" onclick="event.stopPropagation();resetTile('{p["id"]}')">&#x2715;</span>
         </div>
         '''
 
@@ -588,6 +667,32 @@ def lookup():
     let items = {{}};
     let total = 0.0;
     let pendingOtherId = null;
+    let customPrices = {{}};
+
+    function setCustomPrice(id, defaultPrice) {{
+        let current = customPrices[id] !== undefined ? customPrices[id] : defaultPrice;
+        let newPriceStr = prompt("Enter new custom price (£) for this order:", current);
+        
+        if(newPriceStr === null || newPriceStr.trim() === "") return;
+        let newP = parseFloat(newPriceStr);
+        if(isNaN(newP) || newP < 0) return alert("Invalid price.");
+        
+        customPrices[id] = newP;
+        let disp = document.getElementById("price-display-"+id);
+        if(disp) {{
+            disp.innerText = newP.toFixed(2);
+            disp.style.color = "#eab308"; 
+            disp.style.fontWeight = "bold";
+        }}
+
+        if(items[id]) {{
+            let oldLineTotal = items[id].price * items[id].qty;
+            let newLineTotal = newP * items[id].qty;
+            total = total - oldLineTotal + newLineTotal;
+            items[id].price = newP;
+            document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
+        }}
+    }}
 
     function addQty(id, name, price) {{
         if(name === 'Other' && !items[id]) {{
@@ -616,7 +721,13 @@ def lookup():
     }}
 
     function executeAdd(id, name, price) {{
-        let cPrice = items[id] ? items[id].price : price;
+        let cPrice;
+        if (name === 'Other') {{
+            cPrice = items[id] ? items[id].price : price;
+        }} else {{
+            cPrice = customPrices[id] !== undefined ? customPrices[id] : price;
+        }}
+        
         let cName = items[id] ? items[id].custom_name : null;
         
         if(!items[id]) items[id] = {{qty:0, price: cPrice, custom_name: cName}};
@@ -815,9 +926,16 @@ def deliveries():
     rows = cur.fetchall()
     cur.close(); conn.close()
 
-    # Replaced "Paid" with a Checkmark (✓), blank if Unpaid
+    # Extract unique postcodes for the Routing button
+    unique_postcodes = []
+    for r in rows:
+        pc = r['postcode'].strip() if r['postcode'] else ""
+        if pc and pc not in unique_postcodes:
+            unique_postcodes.append(pc)
+
+    # ADDED data-postcode and a delivery-row class for the Javascript to hook into
     tr = "".join(f'''
-        <tr>
+        <tr class="delivery-row" data-postcode="{r['postcode'].strip() if r['postcode'] else ''}">
             <td><strong>{r['name']}</strong><br><span style="font-family:'DM Mono',monospace;">0{r['phone']}</span></td>
             <td>{r['address']}<br>{r['town']}, {r['postcode']}</td>
             <td style="font-weight:bold; color:var(--accent);">{r['items']}</td>
@@ -836,7 +954,7 @@ def deliveries():
         matrix_headers_2 += f"<td style='font-weight:bold; text-align:center;'>{p['display_name'] or p['name']}</td>"
 
     row_in = "<td><strong>In</strong></td>" + "".join("<td></td>" for _ in butane + propane)
-    row_delivered = "<td><strong>Out</strong></td>"
+    row_delivered = "<td><strong>Delivered</strong></td>"
     row_truck = "<td><strong>Total on Truck</strong></td>"
     row_net = "<td><strong>Net Wt (tons)</strong></td>"
     row_gross = "<td><strong>Gross Wt (tons)</strong></td>"
@@ -856,14 +974,12 @@ def deliveries():
     body = f'''
     <style>
     @media print {{
-        /* Enable browser margin so native page numbers print */
         @page {{ size: landscape; margin: 10mm; }}
         body {{ background: white !important; color: black !important; }}
         nav, .no-print {{ display: none !important; }}
         .print-only {{ display: block !important; }}
         .print-table-row {{ display: table-row !important; }}
         
-        /* Enforce exact uniform font sizing on paper */
         * {{ font-size: 10pt !important; }}
         h2 {{ font-size: 14pt !important; margin: 0 0 10px 0 !important; }}
         
@@ -873,16 +989,15 @@ def deliveries():
         th, td {{ border: 1px solid #000 !important; color: black !important; padding: 6px !important; vertical-align: middle; }}
         .matrix-input {{ border: none !important; background: transparent !important; width: 100%; text-align: center; font-weight: bold; padding:0; }}
         
-        /* Force the Matrix and Footer to a new page */
         .matrix-container {{ page-break-before: always; break-before: page; }}
         
-        /* Static Footer Styling */
         .footer-container {{ border: 2px solid #000; padding: 10px; margin-top: 20px; page-break-inside: avoid; }}
         .footer-grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; border-bottom: 1px dashed #000; padding-bottom: 10px; margin-bottom: 10px; }}
         .footer-grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px; }}
     }}
     .matrix-input {{ width: 60px; padding: 4px; text-align: center; border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 4px; }}
     .print-only, .print-table-row {{ display: none; }}
+    .empty-row td {{ height: 50px; }}
     </style>
     
     <div class="no-print" style="margin-bottom: 24px;">
@@ -891,11 +1006,11 @@ def deliveries():
 
     <form id="run-form" action="/export_delivery_excel" method="GET">
         <div class="card no-print" style="display:flex; gap:20px; align-items:flex-end; flex-wrap:wrap; margin-bottom:24px;">
-            <div style="flex:1; min-width:200px;">
+            <div style="flex:1; min-width:180px;">
                 <label style="font-weight:bold;color:var(--muted);display:block;margin-bottom:8px;">Delivery Date:</label>
                 <input type="date" name="date" class="modern-input" value="{target_date}" style="margin:0;" onchange="window.location.href='/deliveries?date='+this.value">
             </div>
-            <div style="flex:2; min-width:200px;">
+            <div style="flex:2; min-width:180px;">
                 <label style="font-weight:bold;color:var(--muted);display:block;margin-bottom:8px;">Driver Name:</label>
                 <select id="driver_input" name="driver" class="modern-input" style="margin:0; padding:12px;">
                     <option value="Craig Batterton">Craig Batterton</option>
@@ -903,14 +1018,15 @@ def deliveries():
                     <option value="Rajesh Singh">Rajesh Singh</option>
                 </select>
             </div>
-            <div style="flex:2; min-width:200px;">
+            <div style="flex:2; min-width:180px;">
                 <label style="font-weight:bold;color:var(--muted);display:block;margin-bottom:8px;">Vehicle Reg:</label>
                 <select id="vehicle_input" name="vehicle_reg" class="modern-input" style="margin:0; padding:12px;">
                     <option value="DU14 EWG">DU14 EWG</option>
                     <option value="YS63 VPX">YS63 VPX</option>
                 </select>
             </div>
-            <div style="display:flex; gap:12px;">
+            <div style="display:flex; gap:12px; align-items:flex-end;">
+                <button type="button" id="route-btn" class="btn btn-primary" onclick="calculateRoute()" style="background:#8b5cf6;height:48px; border:none; min-width:150px;">🗺️ Auto-Sort Route</button>
                 <button type="button" class="btn btn-ghost" onclick="triggerPrint()" style="height:48px;">🖨️ Print</button>
                 <button type="submit" class="btn btn-primary" style="background:var(--success);height:48px;">📊 Excel</button>
             </div>
@@ -923,7 +1039,7 @@ def deliveries():
                         <td colspan="5" style="border:none !important; border-bottom:2px solid #000 !important; padding-bottom:10px !important;">
                             <h2 style="margin:0 0 5px 0;">Delivery Run Sheet</h2>
                             <div style="font-weight: bold; display:flex; justify-content:space-between;">
-                                <span>Date: {target_date}</span>
+                                <span>Date: {target_date} <span style="font-weight:normal;">(Printed: <span id="print_time"></span>)</span></span>
                                 <span>Driver: <span id="print_driver"></span></span>
                                 <span>Vehicle: <span id="print_vehicle"></span></span>
                             </div>
@@ -931,11 +1047,11 @@ def deliveries():
                     </tr>
                     <tr><th>Customer</th><th>Address</th><th>Order Items</th><th>Paid</th><th>Notes</th></tr>
                 </thead>
-                <tbody>
-                    {tr}
-                    <tr><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
-                    <tr><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
-                    <tr><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
+                <tbody id="deliveries-tbody">
+                    {tr or '<tr><td colspan="5" style="text-align:center;padding:20px;">No deliveries.</td></tr>'}
+                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
+                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
+                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
                 </tbody>
             </table>
         </div>
@@ -1031,7 +1147,10 @@ def deliveries():
     calcMatrix();
 
     function triggerPrint() {{
-        // Populate the repeating print headers
+        const now = new Date();
+        const timeString = now.toLocaleTimeString([], {{hour: '2-digit', minute:'2-digit'}});
+        document.getElementById('print_time').innerText = timeString;
+
         const drivers = document.querySelectorAll('#print_driver');
         const vehicles = document.querySelectorAll('#print_vehicle');
         const selDriver = document.getElementById('driver_input').value;
@@ -1041,6 +1160,64 @@ def deliveries():
         vehicles.forEach(v => v.innerText = selVehicle);
         
         window.print();
+    }}
+
+    // NEW: Javascript function that re-sorts the table rows
+    async function calculateRoute() {{
+        const postcodes = {json.dumps(unique_postcodes)};
+        if (postcodes.length === 0) {{
+            alert("No postcodes found for today's deliveries to route.");
+            return;
+        }}
+        
+        const btn = document.getElementById('route-btn');
+        const originalText = btn.innerText;
+        btn.innerText = "⏳ Optimizing...";
+        btn.disabled = true;
+
+        try {{
+            let res = await fetch('/api/optimize_route', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{postcodes: postcodes}})
+            }});
+            
+            let data = await res.json();
+            
+            if (data.error) {{
+                alert("Optimization Failed: " + data.error);
+                btn.innerText = originalText;
+                btn.disabled = false;
+                return;
+            }}
+
+            // Get the table and all the delivery rows
+            const tbody = document.getElementById('deliveries-tbody');
+            const rows = Array.from(tbody.querySelectorAll('.delivery-row'));
+            const emptyRows = Array.from(tbody.querySelectorAll('.empty-row'));
+
+            // Sort the rows by appending them in the exact order the backend API returned
+            data.optimized.forEach(optPostcode => {{
+                // Find all rows that match this optimized postcode (handles multiple customers at the same postcode)
+                const matchingRows = rows.filter(row => row.getAttribute('data-postcode') === optPostcode);
+                matchingRows.forEach(row => tbody.appendChild(row));
+            }});
+            
+            // Push the empty rows back to the very bottom
+            emptyRows.forEach(row => tbody.appendChild(row));
+
+            // Success feedback
+            btn.innerText = "✅ Sorted!";
+            setTimeout(() => {{
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }}, 3000);
+
+        }} catch (e) {{
+            alert("Network error while trying to calculate route.");
+            btn.innerText = originalText;
+            btn.disabled = false;
+        }}
     }}
     </script>
     '''
@@ -1679,9 +1856,12 @@ def cash():
         short_name = p.get("display_name") or p["name"] 
         
         tiles += f'''
-        <div class="product-tile" id="tile-{p["id"]}" style="background-color: {bg_color}; padding: 12px 8px;" onclick="addQty('{p["id"]}', '{safe_name}', {p["price"]})">
+        <div class="product-tile" id="tile-{p["id"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["id"]}', '{safe_name}', {p["price"]})">
             <div class="p-name" style="font-size:1rem;">{short_name}</div>
-            <div style="font-size:0.9rem;color:var(--muted);margin-top:4px;">£{p["price"]}</div>
+            <div style="font-size:0.9rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
+                £<span id="price-display-{p['id']}">{p["price"]}</span>
+                <span onclick="event.stopPropagation(); setCustomPrice('{p['id']}', {p['price']})" style="cursor:pointer; font-size:0.85rem;" title="Give Discount">✏️</span>
+            </div>
             <div class="p-qty" id="qty-{p["id"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
             <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["id"]}" onclick="event.stopPropagation();resetTile('{p["id"]}')">&#x2715;</span>
         </div>
@@ -1733,20 +1913,57 @@ def cash():
     </div>
 
     <script>
-    let items = {{}}; let total = 0.0;
+    let items = {{}}; 
+    let total = 0.0;
+    let customPrices = {{}}; 
+
+    function setCustomPrice(id, defaultPrice) {{
+        let current = customPrices[id] !== undefined ? customPrices[id] : defaultPrice;
+        let newPriceStr = prompt("Enter new custom price (£) for this order:", current);
+        
+        if(newPriceStr === null || newPriceStr.trim() === "") return;
+        let newP = parseFloat(newPriceStr);
+        if(isNaN(newP) || newP < 0) return alert("Invalid price.");
+        
+        customPrices[id] = newP;
+        let disp = document.getElementById("price-display-"+id);
+        if(disp) {{
+            disp.innerText = newP.toFixed(2);
+            disp.style.color = "#eab308"; 
+            disp.style.fontWeight = "bold";
+        }}
+
+        if(items[id]) {{
+            let oldLineTotal = items[id].price * items[id].qty;
+            let newLineTotal = newP * items[id].qty;
+            total = total - oldLineTotal + newLineTotal;
+            items[id].price = newP;
+            document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
+        }}
+    }}
+
     function addQty(id, name, price) {{
-        let cName = null; let cPrice = price;
+        let cName = null; 
+        let cPrice = customPrices[id] !== undefined ? customPrices[id] : price; 
+        
         if(name === 'Other') {{
             cName = prompt("Enter specific product name:"); if(!cName) return;
-            let priceStr = prompt("Enter price (£):"); cPrice = parseFloat(priceStr); if(isNaN(cPrice)) return;
+            let priceStr = prompt("Enter price (£):"); 
+            cPrice = parseFloat(priceStr); 
+            if(isNaN(cPrice)) return;
+            customPrices[id] = cPrice; 
         }}
+        
         if(!items[id]) items[id] = {{qty:0, price: cPrice, custom_name: cName}};
-        items[id].qty += 1; total += cPrice;
+        items[id].qty += 1; 
+        total += cPrice;
+        
         document.getElementById("qty-"+id).textContent = items[id].qty;
         document.getElementById("tile-"+id).classList.add("selected");
         document.getElementById("reset-"+id).style.display = "block";
         document.getElementById("live-total").innerText = total.toFixed(2);
     }}
+
     function resetTile(id) {{
         if(items[id]) total -= (items[id].price * items[id].qty);
         delete items[id];
@@ -1755,6 +1972,7 @@ def cash():
         document.getElementById("reset-"+id).style.display = "none";
         document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
     }}
+
     function prepareSubmit() {{
         if(!Object.keys(items).length) {{ alert("Select a product."); return false; }}
         document.getElementById("items-input").value = JSON.stringify(items);
