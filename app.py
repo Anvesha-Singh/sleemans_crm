@@ -390,6 +390,24 @@ def reload_cache():
     get_all_products.cache_clear()
     return redirect(request.referrer or "/search")
 
+@app.route("/update_delivery_date", methods=["POST"])
+@login_required
+def update_delivery_date():
+    order_id = request.form.get("order_id")
+    new_date = request.form.get("new_date")
+    return_date = request.form.get("return_date")
+
+    if order_id and new_date:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE orders SET delivery_date = %s WHERE id = %s", (new_date, order_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    # Bounce the user straight back to the run sheet they were just looking at
+    return redirect(f"/deliveries?date={return_date}")
+
 @app.route("/api/optimize_route", methods=["POST"])
 @login_required
 def optimize_route():
@@ -933,7 +951,7 @@ def deliveries():
         if pc and pc not in unique_postcodes:
             unique_postcodes.append(pc)
 
-    # ADDED data-postcode and a delivery-row class for the Javascript to hook into
+    # Added a hidden form in a new Actions column to instantly update delivery date
     tr = "".join(f'''
         <tr class="delivery-row" data-postcode="{r['postcode'].strip() if r['postcode'] else ''}">
             <td><strong>{r['name']}</strong><br><span style="font-family:'DM Mono',monospace;">0{r['phone']}</span></td>
@@ -941,6 +959,14 @@ def deliveries():
             <td style="font-weight:bold; color:var(--accent);">{r['items']}</td>
             <td style="text-align:center; font-weight:bold; font-size:12pt;">{"✓" if r['is_paid'] else ""}</td>
             <td>{r['notes'] or ''}</td>
+            <td class="no-print">
+                <form method="POST" action="/update_delivery_date" style="display:flex; gap:6px; flex-direction:column;">
+                    <input type="hidden" name="order_id" value="{r['id']}">
+                    <input type="hidden" name="return_date" value="{target_date}">
+                    <input type="date" name="new_date" value="{target_date}" class="modern-input" style="margin:0; padding:6px; font-size:0.85rem;">
+                    <button class="btn btn-ghost" style="padding:4px 8px; font-size:0.8rem;">Move Date</button>
+                </form>
+            </td>
         </tr>
     ''' for r in rows)
 
@@ -973,6 +999,16 @@ def deliveries():
 
     body = f'''
     <style>
+    /* REMOVE ARROWS FROM NUMBER INPUTS */
+    input[type=number]::-webkit-outer-spin-button,
+    input[type=number]::-webkit-inner-spin-button {{
+        -webkit-appearance: none;
+        margin: 0;
+    }}
+    input[type=number] {{
+        -moz-appearance: textfield;
+    }}
+
     @media print {{
         @page {{ size: landscape; margin: 10mm; }}
         body {{ background: white !important; color: black !important; }}
@@ -1036,7 +1072,7 @@ def deliveries():
             <table>
                 <thead style="background:var(--surface)">
                     <tr class="print-table-row">
-                        <td colspan="5" style="border:none !important; border-bottom:2px solid #000 !important; padding-bottom:10px !important;">
+                        <td colspan="6" style="border:none !important; border-bottom:2px solid #000 !important; padding-bottom:10px !important;">
                             <h2 style="margin:0 0 5px 0;">Delivery Run Sheet</h2>
                             <div style="font-weight: bold; display:flex; justify-content:space-between;">
                                 <span>Date: {target_date} <span style="font-weight:normal;">(Printed: <span id="print_time"></span>)</span></span>
@@ -1045,13 +1081,13 @@ def deliveries():
                             </div>
                         </td>
                     </tr>
-                    <tr><th>Customer</th><th>Address</th><th>Order Items</th><th>Paid</th><th>Notes</th></tr>
+                    <tr><th>Customer</th><th>Address</th><th>Order Items</th><th>Paid</th><th>Notes</th><th class="no-print">Actions</th></tr>
                 </thead>
                 <tbody id="deliveries-tbody">
-                    {tr or '<tr><td colspan="5" style="text-align:center;padding:20px;">No deliveries.</td></tr>'}
-                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
-                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
-                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
+                    {tr or '<tr><td colspan="6" style="text-align:center;padding:20px;">No deliveries.</td></tr>'}
+                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td><td class="no-print"></td></tr>
+                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td><td class="no-print"></td></tr>
+                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td><td class="no-print"></td></tr>
                 </tbody>
             </table>
         </div>
@@ -1162,7 +1198,6 @@ def deliveries():
         window.print();
     }}
 
-    // NEW: Javascript function that re-sorts the table rows
     async function calculateRoute() {{
         const postcodes = {json.dumps(unique_postcodes)};
         if (postcodes.length === 0) {{
@@ -1191,22 +1226,17 @@ def deliveries():
                 return;
             }}
 
-            // Get the table and all the delivery rows
             const tbody = document.getElementById('deliveries-tbody');
             const rows = Array.from(tbody.querySelectorAll('.delivery-row'));
             const emptyRows = Array.from(tbody.querySelectorAll('.empty-row'));
 
-            // Sort the rows by appending them in the exact order the backend API returned
             data.optimized.forEach(optPostcode => {{
-                // Find all rows that match this optimized postcode (handles multiple customers at the same postcode)
                 const matchingRows = rows.filter(row => row.getAttribute('data-postcode') === optPostcode);
                 matchingRows.forEach(row => tbody.appendChild(row));
             }});
             
-            // Push the empty rows back to the very bottom
             emptyRows.forEach(row => tbody.appendChild(row));
 
-            // Success feedback
             btn.innerText = "✅ Sorted!";
             setTimeout(() => {{
                 btn.innerText = originalText;
