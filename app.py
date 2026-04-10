@@ -160,19 +160,50 @@ def get_delivery_schedule(town):
     return row[0] if row else "Unscheduled"
 
 # ── ANALYTICS HELPERS ─────────────────────────
-
-def get_top_customers(start, end):
+def get_daily_weather_sales(start, end):
     conn = get_db()
     cur = conn.cursor()
+    # Get daily sales grouped by gas type
     cur.execute("""
-        SELECT c.name, COUNT(*) as cnt
-        FROM orders o JOIN customers c ON o.phone=c.phone
-        WHERE o.order_date BETWEEN %s AND %s
-        GROUP BY c.name ORDER BY cnt DESC LIMIT 10
-    """,(start,end))
+        SELECT o.order_date, p.gas_type, SUM(oi.quantity) as qty
+        FROM orders o
+        JOIN order_items oi ON o.id=oi.order_id
+        JOIN products p ON oi.product_id=p.id
+        WHERE o.order_date BETWEEN %s AND %s AND p.gas_type IN ('Butane', 'Propane')
+        GROUP BY o.order_date, p.gas_type
+    """, (start, end))
     rows = cur.fetchall()
     cur.close(); conn.close()
-    return rows
+
+    # Fetch weather for the requested date range using Open-Meteo (Swindon Coordinates)
+    weather = {}
+    try:
+        url = f"https://api.open-meteo.com/v1/forecast?latitude=51.55&longitude=-1.78&start_date={start}&end_date={end}&daily=temperature_2m_mean&timezone=Europe/London"
+        r = requests.get(url, timeout=5).json()
+        weather = dict(zip(r["daily"]["time"], r["daily"]["temperature_2m_mean"]))
+    except Exception as e:
+        print(f"Weather API Error: {e}")
+
+    # Build the matched dataset
+    sales_map = {(str(r["order_date"]), r["gas_type"]): int(r["qty"]) for r in rows}
+    
+    # Ensure we have a continuous list of dates for the graph
+    from datetime import timedelta, datetime
+    start_dt = datetime.strptime(start, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end, "%Y-%m-%d").date()
+    
+    data = {"dates": [], "butane": [], "propane": [], "temp": []}
+    
+    curr = start_dt
+    while curr <= end_dt:
+        d_str = str(curr)
+        data["dates"].append(d_str)
+        data["butane"].append(sales_map.get((d_str, "Butane"), 0))
+        data["propane"].append(sales_map.get((d_str, "Propane"), 0))
+        data["temp"].append(weather.get(d_str, None)) # None leaves a gap in the chart if API fails
+        curr += timedelta(days=1)
+
+    return data
 
 def get_today_revenue():
     today = datetime.today().date()
@@ -200,40 +231,25 @@ def get_today_revenue():
     
     return orders, walkin, sumup_matched, float(raw_sumup)
 
-def get_daily_sales(start, end):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT o.order_date, SUM(oi.quantity) as total
-        FROM orders o
-        JOIN order_items oi ON o.id=oi.order_id
-        WHERE o.order_date BETWEEN %s AND %s
-        GROUP BY o.order_date
-        ORDER BY o.order_date
-    """,(start,end))
-    rows = cur.fetchall()
-    cur.close(); conn.close()
-    return rows
-
-def get_weather_range(start, end):
-    try:
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {"latitude": 51.5072, "longitude": -0.1276, "daily": "temperature_2m_mean", "start_date": start, "end_date": end, "timezone": "Europe/London"}
-        r = requests.get(url, params=params, timeout=5).json()
-        return dict(zip(r["daily"]["time"], r["daily"]["temperature_2m_mean"]))
-    except:
-        return {}
-
 def predict_next_calls(days=3):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT phone, order_date FROM orders ORDER BY phone, order_date")
+    # FIX: Group by date to prevent same-day orders from creating a 0-day interval
+    cur.execute("SELECT phone, order_date FROM orders GROUP BY phone, order_date ORDER BY phone, order_date")
     rows = cur.fetchall()
     cur.close(); conn.close()
     
     from collections import defaultdict
     data = defaultdict(list)
     for r in rows: data[r["phone"]].append(r["order_date"])
+
+    # WEATHER HEURISTIC: Grab the average temperature for the next 14 days
+    try:
+        w_url = "https://api.open-meteo.com/v1/forecast?latitude=51.55&longitude=-1.78&daily=temperature_2m_mean&forecast_days=14&timezone=Europe/London"
+        temps = requests.get(w_url, timeout=3).json()["daily"]["temperature_2m_mean"]
+        upcoming_avg_temp = sum(temps) / len(temps)
+    except:
+        upcoming_avg_temp = 10.0 # Fallback UK baseline
 
     predictions = {i: [] for i in range(days)}
     missed_calls = []
@@ -242,18 +258,34 @@ def predict_next_calls(days=3):
     for phone, dates in data.items():
         if len(dates) < 2: continue
         diffs = [(dates[i]-dates[i-1]).days for i in range(1,len(dates))]
-        avg = round(sum(diffs)/len(diffs))
-        next_date = dates[-1] + timedelta(days=avg)
+        base_avg = sum(diffs)/len(diffs)
+
+        # ADJUSTMENT LOGIC: 
+        # If the forecast drops below 10C, they burn gas faster. Shrink the interval.
+        # If it rises above 10C, they burn gas slower. Extend the interval.
+        # (2% adjustment per degree of deviation from baseline 10C)
+        temp_diff = upcoming_avg_temp - 10.0 
+        adjustment_factor = 1.0 + (temp_diff * 0.02)
+        
+        # Cap the adjustment so the math doesn't spiral out of control (Max 30% shift)
+        adjustment_factor = max(0.7, min(1.3, adjustment_factor))
+        
+        adjusted_avg = round(base_avg * adjustment_factor)
+        
+        # Ensure we always predict at least 1 day into the future
+        next_date = dates[-1] + timedelta(days=max(1, adjusted_avg))
 
         cust = get_customer(phone)
-        name = cust["name"] if cust else phone
+        name = cust["name"] if cust else "Unknown"
+
+        call_data = {"name": name, "phone": phone, "expected": str(next_date)}
 
         if next_date < today:
-            missed_calls.append(f"{name} ({next_date})")
+            missed_calls.append(call_data)
 
         for i in range(days):
             if next_date == today + timedelta(days=i):
-                predictions[i].append(name)
+                predictions[i].append(call_data)
 
     return predictions, missed_calls
 
@@ -352,7 +384,7 @@ NAV = """
   <a href="/deliveries">Deliveries</a>
   <a href="/schedule">Schedules</a>
   <a href="/analytics">Analytics</a>
-  <a href="/cash">Cash</a>
+  <a href="/cash">POS</a>
   <a href="/inventory">Inventory</a>
   <a href="/reload_cache" title="Reload Data" style="margin-left:auto; font-size:1.2rem;">🔄</a>
   <a href="#" onclick="toggleTheme()" id="theme-icon" style="margin-left:auto">&#9728;</a>
@@ -555,18 +587,33 @@ def lookup():
     raw = request.args.get("phone","")
     phone = clean_phone(raw)
 
-    user = get_customer(phone) if phone else None
+    if not phone:
+        return page("Lookup", f'<div class="card" style="border-color:var(--danger)"><h2>Invalid number</h2><p>{raw}</p></div>')
+
+    # NEW ALIAS INTERCEPTOR: Check if this phone points to a master account
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT is_alias_for FROM customers WHERE phone = %s", (phone,))
+    alias_row = cur.fetchone()
+    cur.close(); conn.close()
+
+    # If it's an alias, instantly redirect them to the master profile
+    if alias_row and alias_row['is_alias_for']:
+        return redirect(f"/lookup?phone={alias_row['is_alias_for']}")
+
+    user = get_customer(phone)
     orders = get_orders(phone) if phone else []
     products = get_all_products()
 
-    if not phone:
-        return page("Lookup", f'<div class="card" style="border-color:var(--danger)"><h2>Invalid number</h2><p>{raw}</p></div>')
-    elif not user:
+    if not user:
         return page("Lookup", f'''
         <div class="card" style="border-color:var(--accent)">
             <h2>Unknown caller</h2>
             <p style="font-size:1.2rem;margin:10px 0;">0{phone}</p>
-            <a href="/add_customer?phone={phone}" class="btn btn-primary">+ Add Customer</a>
+            <div style="display:flex; gap:12px; margin-top: 16px;">
+                <a href="/add_customer?phone={phone}" class="btn btn-primary">+ Add New Customer</a>
+                <a href="/link_customer?phone={phone}" class="btn btn-ghost">🔗 Link to Existing Account</a>
+            </div>
         </div>
         ''')
 
@@ -823,6 +870,83 @@ def lookup():
     </script>
     '''
     return page("Lookup", body, wide=True)
+
+@app.route("/link_customer", methods=["GET", "POST"])
+@login_required
+def link_customer():
+    alias_phone = clean_phone(request.args.get("phone", ""))
+    
+    if request.method == "POST":
+        primary_phone = clean_phone(request.form.get("primary_phone"))
+        alias_phone = clean_phone(request.form.get("alias_phone"))
+
+        conn = get_db()
+        cur = conn.cursor()
+        
+        # We insert the new number into the customers table, but flag it as an alias
+        cur.execute("""
+            INSERT INTO customers (phone, name, is_alias_for)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (phone) DO UPDATE SET is_alias_for = EXCLUDED.is_alias_for
+        """, (alias_phone, f"Alias of 0{primary_phone}", primary_phone))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # Redirect to the master profile
+        return redirect(f"/lookup?phone={primary_phone}")
+
+    # For the GET request, grab all customers so they can pick the master account
+    customers = get_all_customers()
+    
+    # Filter out aliases so you don't accidentally link an alias to another alias
+    opts = "".join(f'<option value="{c["phone"]}">0{c["phone"]} - {c["name"]} ({c["postcode"]})</option>' for c in customers if not c.get('is_alias_for'))
+
+    body = f'''
+    <h1>Link Phone Number</h1>
+    <div class="card" style="max-width: 600px;">
+        <p style="margin-bottom:20px; color:var(--muted); line-height:1.5;">
+            Attach <strong>0{alias_phone}</strong> to an existing master account. Future calls from this number will automatically redirect to the master profile.
+        </p>
+        <form method="POST">
+            <input type="hidden" name="alias_phone" value="{alias_phone}">
+            <label style="display:block;margin-bottom:8px;font-weight:bold;color:var(--muted)">Select Master Customer Account</label>
+            
+            <input type="text" id="search-master" class="modern-input" placeholder="🔍 Type name, phone, or postcode to filter..." style="margin-bottom: 8px;">
+            
+            <select name="primary_phone" id="master-select" class="modern-input" required style="height: 50px;">
+                <option value="">-- Choose Customer --</option>
+                {opts}
+            </select>
+            
+            <div style="display:flex; justify-content:flex-end; gap:12px; margin-top:24px;">
+                <a href="/lookup?phone={alias_phone}" class="btn btn-ghost">Cancel</a>
+                <button type="submit" class="btn btn-primary">🔗 Link Number</button>
+            </div>
+        </form>
+    </div>
+    
+    <script>
+        const select = document.getElementById('master-select');
+        const allOptions = Array.from(select.options);
+        
+        document.getElementById('search-master').addEventListener('input', function(e) {{
+            const term = e.target.value.toLowerCase();
+            
+            // Clear current options
+            select.innerHTML = '';
+            
+            // Add back only the options that match the search term
+            allOptions.forEach(opt => {{
+                if(opt.value === "" || opt.text.toLowerCase().includes(term)) {{
+                    select.appendChild(opt);
+                }}
+            }});
+        }});
+    </script>
+    '''
+    return page("Link Customer", body)
 
 @app.route("/api/travel_time")
 @login_required
@@ -1693,26 +1817,28 @@ def edit_customer():
 @app.route("/analytics")
 @login_required
 def analytics():
-    today_str = datetime.today().strftime("%Y-%m-%d")
-    start = request.args.get("start") or today_str
+    # Default to viewing the last 14 days for better weather graphing context
+    today_dt = datetime.today().date()
+    default_start = (today_dt - timedelta(days=14)).strftime("%Y-%m-%d")
+    today_str = today_dt.strftime("%Y-%m-%d")
+    
+    start = request.args.get("start") or default_start
     end = request.args.get("end") or today_str
 
     products_sold = get_products_sold(start, end)
     preds, missed = predict_next_calls(3)
     inventory = get_inventory_status()
+    weather_data = get_daily_weather_sales(start, end)
 
-    # Unpack the 4 revenue streams
     orders_rev, walkin_rev, sumup_matched_rev, raw_sumup_rev = get_today_revenue()
-    
     total_matched = orders_rev + walkin_rev + sumup_matched_rev
     true_total = orders_rev + walkin_rev + raw_sumup_rev
 
+    # Graph 1 Data (Bottle Quantities)
     prod_labels = [p['name'] for p in products_sold]
-    prod_revs = [float(p['revenue']) for p in products_sold]
     prod_qtys = [int(p['qty']) for p in products_sold]
-    period_rev = sum(prod_revs)
+    period_rev = sum([float(p['revenue']) for p in products_sold])
 
-    # FIX: Build the inventory warning HTML outside the f-string to prevent backslash syntax errors
     inventory_html = ""
     for i in inventory:
         inventory_html += f'''
@@ -1722,15 +1848,43 @@ def analytics():
         </div>
         '''
 
+    call_rows = ""
+    all_expected = missed + preds.get(0, [])
+    for item in all_expected:
+        phone, expected, name = item['phone'], item['expected'], item['name']
+        is_late = expected < today_str
+        date_color = "var(--danger)" if is_late else "var(--accent)"
+        
+        call_rows += f'''
+        <tr class="predictive-row" data-call-id="{phone}_{expected}">
+            <td>
+                <a href="/lookup?phone={phone}" style="color:var(--text); text-decoration:none; display:flex; flex-direction:column; gap:4px; padding:4px 0;">
+                    <strong style="color:var(--accent); font-size:1.05rem; transition:color 0.2s;">{name}</strong>
+                    <span style="color:var(--muted); font-family:'DM Mono',monospace; font-size:0.9rem;">0{phone}</span>
+                </a>
+            </td>
+            <td style="text-align:right; vertical-align:middle;">
+                <div style="font-size:0.85rem; color:var(--muted); margin-bottom:8px;">
+                    Expected: <strong style="color:{date_color}">{expected}</strong>
+                </div>
+                <button type="button" class="btn btn-ghost" onclick="dismissCall('{phone}', '{expected}')" style="padding:4px 10px; font-size:0.8rem;">
+                    ✓ Dismiss
+                </button>
+            </td>
+        </tr>
+        '''
+        
+    if not call_rows: call_rows = '<tr><td colspan="2" style="text-align:center; padding:16px; color:var(--muted)">No expected calls.</td></tr>'
+
     body = f"""
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;">
-        <h1 style="margin:0">Analytics</h1>
+        <h1 style="margin:0">Analytics & Weather</h1>
         <div style="display:flex;gap:12px;">
             <a href="/download_customers" class="btn btn-ghost">📥 Export Customers</a>
             <a href="/download_orders?start={start}&end={end}" class="btn btn-ghost">📥 Export Orders</a>
-            <button type="button" class="btn btn-primary" onclick="alert('Matched Order Revenue: £{period_rev:.2f}')">💰 Show Revenue</button>
+            <button type="button" class="btn btn-primary" onclick="alert('Matched Revenue for Period: £{period_rev:.2f}')">💰 Show Revenue</button>
         </div>
     </div>
 
@@ -1748,27 +1902,17 @@ def analytics():
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
 
-        <div class="card" style="grid-column:1 / span 2">
-            <h3 style="margin-bottom:16px;">Revenue & Quantity by Product</h3>
-            <div style="position:relative; height:350px; width:100%;">
-                <canvas id="product-revenue"></canvas>
-            </div>
-        </div>
-
-        <div class="card" style="border-color: var(--success); border-width: 2px;">
-            <h3 style="margin-bottom:8px; color: var(--success);">True Gross Revenue (£{true_total:.2f})</h3>
-            <div style="color:var(--text);margin-bottom:16px;font-size:0.95rem; font-weight:bold;">
-                System Cash/Deliv: £{orders_rev + walkin_rev:.2f} | Total SumUp: £{raw_sumup_rev:.2f}
-            </div>
-            <div style="position:relative; height:250px; width:100%; display:flex; justify-content:center;">
-                <canvas id="true-revenue-split"></canvas>
-            </div>
-        </div>
-
         <div class="card">
-            <h3 style="margin-bottom:8px;">Matched System Split (£{total_matched:.2f})</h3>
-            <div style="color:var(--muted);margin-bottom:16px;font-size:0.95rem;">
-                Deliv: £{orders_rev:.2f} | Walk-in: £{walkin_rev:.2f} | SumUp: £{sumup_matched_rev:.2f}
+            <h3 style="margin-bottom:16px;">Total Bottles Sold (By Type)</h3>
+            <div style="position:relative; height:300px; width:100%;">
+                <canvas id="bottles-chart"></canvas>
+            </div>
+        </div>
+        
+        <div class="card" style="border-color: var(--success); border-width: 2px;">
+            <h3 style="margin-bottom:8px; color: var(--success);">Today's Revenue Split (£{true_total:.2f})</h3>
+            <div style="color:var(--text);margin-bottom:16px;font-size:0.95rem; font-weight:bold;">
+                Matched System: £{total_matched:.2f} | Total SumUp: £{raw_sumup_rev:.2f}
             </div>
             <div style="position:relative; height:250px; width:100%; display:flex; justify-content:center;">
                 <canvas id="revenue-split"></canvas>
@@ -1776,8 +1920,33 @@ def analytics():
         </div>
 
         <div class="card" style="grid-column:1 / span 2">
+            <h3 style="margin-bottom:16px;">🌤️ Weather Correlation (Gas Type vs Temperature)</h3>
+            <div style="position:relative; height:400px; width:100%;">
+                <canvas id="weather-correlation"></canvas>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3 style="margin-bottom:8px;">☎️ Expected Calls</h3>
+            <div style="color:var(--muted);margin-bottom:16px;font-size:0.95rem;">
+                Predictions factor in history + 14-day weather forecast.
+            </div>
+            <div style="overflow-y:auto; max-height:250px; border:1px solid var(--border); border-radius:8px;">
+                <table style="width:100%; font-size:0.95rem; margin:0;">
+                    <thead style="background:var(--surface)">
+                        <tr>
+                            <th style="padding:12px; border-bottom:1px solid var(--border);">Customer Profile</th>
+                            <th style="text-align:right; padding:12px; border-bottom:1px solid var(--border);">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="predictive-tbody">{call_rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="card">
             <h3>📦 Inventory Depletion Warnings</h3>
-            <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(250px, 1fr));gap:16px;margin-top:16px;">
+            <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(200px, 1fr));gap:16px;margin-top:16px;">
                 {inventory_html or '<div style="color:var(--muted)">No inventory data available.</div>'}
             </div>
         </div>
@@ -1785,22 +1954,76 @@ def analytics():
     </div>
 
     <script>
-    new Chart(document.getElementById('product-revenue'), {{
+    function dismissCall(phone, expectedDate) {{
+        const callId = phone + '_' + expectedDate;
+        let dismissed = JSON.parse(localStorage.getItem('dismissed_calls') || '{{}}');
+        dismissed[callId] = true;
+        localStorage.setItem('dismissed_calls', JSON.stringify(dismissed));
+        hideDismissedRows();
+    }}
+
+    function hideDismissedRows() {{
+        let dismissed = JSON.parse(localStorage.getItem('dismissed_calls') || '{{}}');
+        let rows = document.querySelectorAll('.predictive-row');
+        let visibleCount = 0;
+        
+        rows.forEach(row => {{
+            let id = row.getAttribute('data-call-id');
+            if (dismissed[id]) row.style.display = 'none';
+            else {{ row.style.display = ''; visibleCount++; }}
+        }});
+        
+        const tbody = document.getElementById('predictive-tbody');
+        let emptyRow = document.getElementById('empty-predictive-msg');
+        
+        if (visibleCount === 0 && rows.length > 0) {{
+            if (!emptyRow) tbody.innerHTML += '<tr id="empty-predictive-msg"><td colspan="2" style="text-align:center; padding:16px; color:var(--muted)">All expected calls handled.</td></tr>';
+        }} else if (emptyRow) emptyRow.remove();
+    }}
+    document.addEventListener("DOMContentLoaded", hideDismissedRows);
+
+    // Graph 1: Simple Bottle Qty
+    new Chart(document.getElementById('bottles-chart'), {{
         type: 'bar',
         data: {{
             labels: {json.dumps(prod_labels)},
+            datasets: [{{
+                label: 'Bottles Sold',
+                data: {json.dumps(prod_qtys)},
+                backgroundColor: '#3b82f6',
+            }}]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false }}
+    }});
+
+    // Graph 2: Weather Correlation (Mixed Chart)
+    const weatherData = {json.dumps(weather_data)};
+    new Chart(document.getElementById('weather-correlation'), {{
+        type: 'bar',
+        data: {{
+            labels: weatherData.dates,
             datasets: [
                 {{
-                    label: 'Revenue (£)',
-                    data: {json.dumps(prod_revs)},
-                    backgroundColor: '#3b82f6',
-                    yAxisID: 'y'
+                    label: 'Temperature (°C)',
+                    data: weatherData.temp,
+                    type: 'line',
+                    borderColor: '#ef4444',
+                    backgroundColor: '#ef4444',
+                    borderWidth: 3,
+                    tension: 0.3,
+                    yAxisID: 'yTemp'
                 }},
                 {{
-                    label: 'Bottles Sold (Qty)',
-                    data: {json.dumps(prod_qtys)},
-                    backgroundColor: '#f97316',
-                    yAxisID: 'y1'
+                    label: 'Propane Sold',
+                    data: weatherData.propane,
+                    backgroundColor: '#fca5a5', // Light red to match Propane tag
+                    yAxisID: 'yQty'
+                }},
+                {{
+                    label: 'Butane Sold',
+                    data: weatherData.butane,
+                    backgroundColor: '#fde68a', // Yellow to match Butane tag
+                    yAxisID: 'yQty'
                 }}
             ]
         }},
@@ -1808,33 +2031,32 @@ def analytics():
             responsive: true,
             maintainAspectRatio: false,
             scales: {{
-                y: {{ type: 'linear', position: 'left', title: {{ display: true, text: 'Revenue (£)' }} }},
-                y1: {{ type: 'linear', position: 'right', title: {{ display: true, text: 'Bottle Quantity' }}, grid: {{ drawOnChartArea: false }} }}
+                x: {{ stacked: true }},
+                yQty: {{ 
+                    stacked: true, 
+                    type: 'linear', 
+                    position: 'left', 
+                    title: {{ display: true, text: 'Total Bottles Sold' }} 
+                }},
+                yTemp: {{ 
+                    type: 'linear', 
+                    position: 'right', 
+                    title: {{ display: true, text: 'Avg Daily Temp (°C)' }},
+                    grid: {{ drawOnChartArea: false }} 
+                }}
             }}
         }}
     }});
 
-    new Chart(document.getElementById('true-revenue-split'), {{
-        type: 'doughnut',
-        data: {{
-            labels: ['System Orders', 'All SumUp Sales'],
-            datasets: [{{
-                data: [{orders_rev + walkin_rev}, {raw_sumup_rev}],
-                backgroundColor: ['#22c55e', '#a855f7'],
-                borderColor: ['#16a34a', '#9333ea']
-            }}]
-        }},
-        options: {{ responsive:true, maintainAspectRatio: false }}
-    }});
-
+    // Graph 3: Revenue Split
     new Chart(document.getElementById('revenue-split'), {{
         type: 'doughnut',
         data: {{
-            labels: ['Deliveries', 'Walk-ins', 'SumUp (Matched)'],
+            labels: ['Deliveries', 'Walk-ins', 'SumUp (Matched)', 'SumUp (Unmatched)'],
             datasets: [{{
-                data: [{orders_rev}, {walkin_rev}, {sumup_matched_rev}],
-                backgroundColor: ['#3b82f6', '#f97316', '#a855f7'],
-                borderColor: ['#2563eb', '#ea580c', '#9333ea']
+                data: [{orders_rev}, {walkin_rev}, {sumup_matched_rev}, {max(0, raw_sumup_rev - sumup_matched_rev)}],
+                backgroundColor: ['#3b82f6', '#f97316', '#a855f7', '#4b5563'],
+                borderColor: ['#2563eb', '#ea580c', '#9333ea', '#374151']
             }}]
         }},
         options: {{ responsive:true, maintainAspectRatio: false }}
