@@ -590,16 +590,18 @@ def lookup():
     if not phone:
         return page("Lookup", f'<div class="card" style="border-color:var(--danger)"><h2>Invalid number</h2><p>{raw}</p></div>')
 
-    # NEW ALIAS INTERCEPTOR: Check if this phone points to a master account
+    # ALIAS INTERCEPTOR
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT is_alias_for FROM customers WHERE phone = %s", (phone,))
-    alias_row = cur.fetchone()
+    try:
+        cur.execute("SELECT is_alias_for FROM customers WHERE phone = %s", (phone,))
+        alias_row = cur.fetchone()
+        if alias_row and alias_row['is_alias_for']:
+            cur.close(); conn.close()
+            return redirect(f"/lookup?phone={alias_row['is_alias_for']}")
+    except Exception:
+        conn.rollback() 
     cur.close(); conn.close()
-
-    # If it's an alias, instantly redirect them to the master profile
-    if alias_row and alias_row['is_alias_for']:
-        return redirect(f"/lookup?phone={alias_row['is_alias_for']}")
 
     user = get_customer(phone)
     orders = get_orders(phone) if phone else []
@@ -612,7 +614,7 @@ def lookup():
             <p style="font-size:1.2rem;margin:10px 0;">0{phone}</p>
             <div style="display:flex; gap:12px; margin-top: 16px;">
                 <a href="/add_customer?phone={phone}" class="btn btn-primary">+ Add New Customer</a>
-                <a href="/link_customer?phone={phone}" class="btn btn-ghost">🔗 Link to Existing Account</a>
+                <a href="/link_customer?phone={phone}" class="btn btn-ghost" style="border: 1px solid var(--border);">🔗 Link to Existing Account</a>
             </div>
         </div>
         ''')
@@ -620,7 +622,17 @@ def lookup():
     initial = (user['name'] or '?')[0].upper()
     sched = get_delivery_schedule(user.get("town"))
 
-    # Orders List (For the Left Column)
+    # NEW: Fetch Special Prices if the customer is flagged
+    special_prices = {}
+    if user.get("has_special_prices"):
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT product_id, price FROM customer_special_prices WHERE phone = %s", (phone,))
+        for r in cur.fetchall():
+            special_prices[str(r['product_id'])] = float(r['price'])
+        cur.close(); conn.close()
+
+    # Orders List
     order_cards = ""
     for o in orders[:5]:
         tags = "".join(f'<span style="background:var(--surface);border:1px solid var(--border);padding:4px 8px;border-radius:4px;margin-right:6px;display:inline-block;margin-bottom:4px;font-size:0.9rem;">{i["product"]} <strong style="color:var(--accent)">x{i["qty"]}</strong></span>' for i in o["items"])
@@ -648,19 +660,25 @@ def lookup():
 
     if not order_cards: order_cards = '<div class="card" style="text-align:center;color:var(--muted)">No previous orders.</div>'
 
-    # Product Tiles (Condensed size for the Order Pad)
+    # Product Tiles
     tiles = ""
     for p in products:
         bg_color = p.get('color', 'var(--surface)')
         safe_name = p["name"].replace("'", "\\'") 
         short_name = p.get("display_name") or p["name"] 
+        pid_str = str(p['id'])
+        
+        # Check if this specific product has a special price
+        is_special = pid_str in special_prices
+        display_price = special_prices[pid_str] if is_special else p["price"]
+        price_style = "color:#eab308; font-weight:bold;" if is_special else ""
         
         tiles += f'''
         <div class="product-tile" id="tile-{p["id"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["id"]}', '{safe_name}', {p["price"]})">
             <div class="p-name" style="font-size:1rem;">{short_name}</div>
             <div style="font-size:0.9rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
-                £<span id="price-display-{p['id']}">{p["price"]}</span>
-                <span onclick="event.stopPropagation(); setCustomPrice('{p['id']}', {p['price']})" style="cursor:pointer; font-size:0.85rem;" title="Give Discount">✏️</span>
+                £<span id="price-display-{p['id']}" style="{price_style}">{display_price}</span>
+                <span onclick="event.stopPropagation(); setCustomPrice('{p['id']}', {display_price})" style="cursor:pointer; font-size:0.85rem;" title="Edit Special Price">✏️</span>
             </div>
             <div class="p-qty" id="qty-{p["id"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
             <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["id"]}" onclick="event.stopPropagation();resetTile('{p["id"]}')">&#x2715;</span>
@@ -688,6 +706,7 @@ def lookup():
                     <button class="btn btn-ghost" style="padding:6px 12px;font-size:0.85rem;flex:1;" onclick="getTravelTime('{user.get("postcode","")}')">📍 Calc Time</button> 
                     <a href="/edit_customer?phone={phone}" class="btn btn-ghost" style="padding:6px 12px;font-size:0.85rem;flex:1;text-align:center;">Edit Customer</a>
                 </div>
+                <button type="button" class="btn btn-ghost" style="width:100%; margin-top:4px; padding:6px 12px; font-size:0.85rem;" onclick="addAliasNumber('{phone}')">🔗 Add Secondary Number</button>
                 <form method="POST" action="/delete_customer" style="width:100%; margin-top:4px;" onsubmit="return confirm('WARNING: Are you sure you want to permanently delete this customer? This will also wipe all their historical order data.');">
                     <input type="hidden" name="phone" value="{phone}">
                     <button type="submit" class="btn btn-danger" style="width:100%; padding:6px 12px; font-size:0.85rem;">🗑️ Delete Customer</button>
@@ -762,14 +781,17 @@ def lookup():
     </div>
 
     <script>
+    const currentPhone = "{phone}";
     let items = {{}};
     let total = 0.0;
     let pendingOtherId = null;
-    let customPrices = {{}};
+    
+    // NEW: Inject special prices from the backend directly into JS state
+    let customPrices = {json.dumps(special_prices)};
 
-    function setCustomPrice(id, defaultPrice) {{
+    async function setCustomPrice(id, defaultPrice) {{
         let current = customPrices[id] !== undefined ? customPrices[id] : defaultPrice;
-        let newPriceStr = prompt("Enter new custom price (£) for this order:", current);
+        let newPriceStr = prompt("Enter special permanent price (£) for this customer:", current);
         
         if(newPriceStr === null || newPriceStr.trim() === "") return;
         let newP = parseFloat(newPriceStr);
@@ -781,6 +803,17 @@ def lookup():
             disp.innerText = newP.toFixed(2);
             disp.style.color = "#eab308"; 
             disp.style.fontWeight = "bold";
+        }}
+
+        // NEW: Instantly save this new price to the database via API
+        try {{
+            await fetch('/api/set_special_price', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{phone: currentPhone, product_id: id, price: newP}})
+            }});
+        }} catch(e) {{
+            console.error("Failed to sync special price to database");
         }}
 
         if(items[id]) {{
@@ -823,6 +856,7 @@ def lookup():
         if (name === 'Other') {{
             cPrice = items[id] ? items[id].price : price;
         }} else {{
+            // It will automatically use the special DB price if it was preloaded!
             cPrice = customPrices[id] !== undefined ? customPrices[id] : price;
         }}
         
@@ -867,9 +901,61 @@ def lookup():
             document.getElementById('travel-time').innerText = "Net Error";
         }}
     }}
+
+    function addAliasNumber(masterPhone) {{
+        let alias = prompt("Enter the new phone number you want to link to this account:");
+        if (alias && alias.trim() !== "") {{
+            let form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/quick_alias';
+            
+            let mInput = document.createElement('input');
+            mInput.type = 'hidden';
+            mInput.name = 'master_phone';
+            mInput.value = masterPhone;
+            
+            let aInput = document.createElement('input');
+            aInput.type = 'hidden';
+            aInput.name = 'new_alias';
+            aInput.value = alias;
+            
+            form.appendChild(mInput);
+            form.appendChild(aInput);
+            document.body.appendChild(form);
+            form.submit();
+        }}
+    }}
     </script>
     '''
     return page("Lookup", body, wide=True)
+
+@app.route("/api/set_special_price", methods=["POST"])
+@login_required
+def set_special_price():
+    data = request.json
+    phone = data.get("phone")
+    pid = data.get("product_id")
+    price = data.get("price")
+    
+    if phone and pid is not None and price is not None:
+        conn = get_db()
+        cur = conn.cursor()
+        
+        # 1. Auto-flag the customer as having special prices
+        cur.execute("UPDATE customers SET has_special_prices = TRUE WHERE phone = %s", (phone,))
+        
+        # 2. Save or update the specific product price
+        cur.execute("""
+            INSERT INTO customer_special_prices (phone, product_id, price)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (phone, product_id) DO UPDATE SET price = EXCLUDED.price
+        """, (phone, pid, price))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+    return jsonify({"status": "success"})
 
 @app.route("/link_customer", methods=["GET", "POST"])
 @login_required
